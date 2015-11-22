@@ -7,12 +7,13 @@
 #define CMFTSTUDIO_GUI_H_HEADER_GUARD
 
 #include <stdint.h>
-#include <bgfx.h>               // bgfx::TextureHandle
+#include <bgfx/bgfx.h>          // bgfx::TextureHandle
 #include <cmft/cubemapfilter.h> // cmft::LightingModel
 #include <dm/misc.h>            // dm::realpath, dm::strscpya
 #include "mouse.h"              // Mouse
 #include "context.h"            // cs::*Handle
 #include "settings.h"           // Settings
+#include "renderpipeline.h"     // RenderPipeline::ViewIdGui
 #include "common/imgui.h"
 
 // Constants.
@@ -37,8 +38,6 @@ struct Gui
         HorizontalSpacing = 8,
         FirstPaneY        = -2,
         SecondPaneY       = 7,
-
-        ViewId = 255,
     };
 };
 
@@ -97,6 +96,7 @@ private:
 //-----
 
 void guiInit();
+void guiDrawOverlay();
 void guiDestroy();
 
 struct GuiEvent
@@ -265,6 +265,7 @@ struct BrowserState
     void reset()
     {
         m_scroll         = 0;
+        m_windowsDrives  = false;
         m_filePath[0]    = '\0';
         m_fileName[0]    = '\0';
         m_fileExt[0]     = '\0';
@@ -272,6 +273,7 @@ struct BrowserState
     }
 
     int32_t m_scroll;
+    bool m_windowsDrives;
     char m_filePath[256];
     char m_fileName[128];
     char m_fileExt[16];
@@ -293,7 +295,8 @@ struct BrowserStateFor
 {
     BrowserStateFor(const char* _directory = ".")
     {
-        m_scroll = 0;
+        m_scroll        = 0;
+        m_windowsDrives = false;
         dm::realpath(m_directory, _directory);
     }
 
@@ -306,6 +309,7 @@ struct BrowserStateFor
     };
 
     int32_t m_scroll;
+    bool m_windowsDrives;
     char m_directory[DM_PATH_LEN];
     dm::ListT<File, MaxSelectedT> m_files;
 };
@@ -319,8 +323,51 @@ void imguiBrowser(int32_t _height
                 , bool _showHidden       = false
                 );
 
-// FileBrowser widget.
+// TextureBrowser widget.
 //-----
+
+struct TextureExt
+{
+    enum Enum
+    {
+        Dds,
+        Ktx,
+        Tga,
+        Hdr,
+        Bmp,
+        Gif,
+        Jpg,
+        Jpeg,
+        Png,
+        Pvr,
+        Tif,
+        Tiff,
+
+        Count,
+    };
+};
+
+static const char* sc_textureExtStr[TextureExt::Count] =
+{
+    "dds",
+    "ktx",
+    "tga",
+    "hdr",
+    "bmp",
+    "gif",
+    "jpg",
+    "jpeg",
+    "png",
+    "pvr",
+    "tif",
+    "tiff",
+};
+
+static inline const char* getTextureExtensionStr(uint8_t _ext)
+{
+    CS_CHECK(_ext < TextureExt::Count, "Accessing array out of bounds.");
+    return sc_textureExtStr[_ext];
+}
 
 enum { TextureBrowser_MaxSelectedFiles = 8 };
 struct TextureBrowserWidgetState : public BrowserStateFor<TextureBrowser_MaxSelectedFiles>
@@ -330,16 +377,17 @@ struct TextureBrowserWidgetState : public BrowserStateFor<TextureBrowser_MaxSele
     TextureBrowserWidgetState(const char* _directory = ".")
         : BrowserState(_directory)
     {
-       m_extDds = true;
-       m_extKtx = true;
-       m_extPvr = true;
-       m_events = GuiEvent::None;
-       m_texPickerFor = cs::Material::Albedo;
+        m_scroll = 0;
+        for (uint8_t ii = 0; ii < TextureExt::Count; ++ii)
+        {
+            m_extFlag[ii] = true;
+        }
+        m_events = GuiEvent::None;
+        m_texPickerFor = cs::Material::Albedo;
     }
 
-    bool m_extDds;
-    bool m_extKtx;
-    bool m_extPvr;
+    int32_t m_scroll;
+    bool m_extFlag[TextureExt::Count];
     uint8_t m_events;
     cs::Material::Texture m_texPickerFor;
 };
@@ -348,6 +396,7 @@ void imguiTextureBrowserWidget(int32_t _x
                              , int32_t _y
                              , int32_t _width
                              , TextureBrowserWidgetState& _state
+                             , bool _enabled = true
                              );
 
 // MeshSave widget.
@@ -381,8 +430,10 @@ struct MeshBrowserState : public BrowserState
     MeshBrowserState(const char* _directory = ".")
         : BrowserState(_directory)
     {
-        m_extBin          = true;
-        m_extObj          = true;
+        for (uint8_t ii = 0; ii < CS_MAX_GEOMETRY_LOADERS; ++ii)
+        {
+            m_extFlag[ii] = true;
+        }
         m_objSelected     = false;
         m_flipV           = true;
         m_ccw             = false;
@@ -390,8 +441,7 @@ struct MeshBrowserState : public BrowserState
         m_events          = GuiEvent::None;
     }
 
-    bool m_extBin;
-    bool m_extObj;
+    bool m_extFlag[CS_MAX_GEOMETRY_LOADERS];
     bool m_objSelected;
     bool m_flipV;
     bool m_ccw;
@@ -880,7 +930,7 @@ struct MagnifyWindowState
     uint8_t m_events;
 };
 
-void imguiModalMagnifyWindow(int32_t _x, int32_t _y, AboutWindowState& _state);
+void imguiModalMagnifyWindow(int32_t _x, int32_t _y, MagnifyWindowState& _state);
 
 
 // Project window.
@@ -933,7 +983,7 @@ void imguiLatlongWidget(int32_t _screenX
                       , uint8_t& _selectedLight
                       , const Mouse& _click
                       , bool _enabled = true
-                      , uint8_t _viewId = Gui::ViewId
+                      , uint8_t _viewId = RenderPipeline::ViewIdGui
                       );
 
 bool imguiEnvPreview(uint32_t _screenX
@@ -942,7 +992,7 @@ bool imguiEnvPreview(uint32_t _screenX
                    , cs::EnvHandle _env
                    , const Mouse& _click
                    , bool _enabled = true
-                   , uint8_t _viewId = Gui::ViewId
+                   , uint8_t _viewId = RenderPipeline::ViewIdGui
                    );
 
 struct LeftScrollAreaState
@@ -1077,7 +1127,7 @@ void imguiRightScrollArea(int32_t _x
                         , const cs::EnvList& _envList
                         , RightScrollAreaState& _state
                         , bool _enabled = true
-                        , uint8_t _viewId = Gui::ViewId
+                        , uint8_t _viewId = RenderPipeline::ViewIdGui
                         );
 
 

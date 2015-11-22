@@ -37,6 +37,7 @@ bool projectSave(const char* _path
                , int32_t _compressionLevel
                , OnValidFile _validFileCallback
                , OnInvalidFile _invalidFileCallback
+               , dm::StackAllocatorI* _stackAlloc
                )
 {
     // Open file for writing.
@@ -63,6 +64,7 @@ bool projectSave(const char* _path
     }
 
     outputWindowPrint("Saving '%s'...", bx::baseName(_path));
+    outputWindowPrint("Path: '%s'", _path);
     outputWindowPrint("--------------------------------------------------------------------------------------------------------");
     outputWindowPrint(" Resource  |                                                                         Name  |      Size  ");
     outputWindowPrint("--------------------------------------------------------------------------------------------------------");
@@ -84,7 +86,7 @@ bool projectSave(const char* _path
     fwrite(&versionMinor, 1, sizeof(versionMinor), file);
 
     // Write compressed data from now on using DeflateFileWriter.
-    cs::DeflateFileWriter writer(file, cs::g_stackAlloc, DM_MEGABYTES(100), DM_MEGABYTES(100), _compressionLevel);
+    cs::DeflateFileWriter writer(file, _stackAlloc, DM_MEGABYTES(100), DM_MEGABYTES(100), _compressionLevel);
 
     const uint64_t totalBefore      = writer.getTotal();
     const uint64_t compressedBefore = writer.getTotalCompressed();
@@ -202,7 +204,7 @@ bool projectLoad(const char* _path
                , Settings& _settings
                , OnValidFile _validFileCallback
                , OnInvalidFile _invalidFileCallback
-               , cs::StackAllocatorI* _stackAlloc
+               , dm::StackAllocatorI* _stackAlloc
                )
 {
     // Open file.
@@ -278,7 +280,7 @@ bool projectLoad(const char* _path
     fileReader.seek(curr, bx::Whence::Begin);
 
     // Read and decompress project data.
-    cs::StackAllocScope scope(_stackAlloc);
+    dm::StackAllocScope scope(_stackAlloc);
     DynamicMemoryBlockWriter memory(_stackAlloc, DM_MEGABYTES(512));
     const bool result = cs::readInflate(&memory, &fileReader, compressedSize, _stackAlloc);
     CS_CHECK(result == true, "cs::readInflate() failed!");
@@ -293,7 +295,7 @@ bool projectLoad(const char* _path
     outputWindowPrint(" Resource  |                                                                         Name  |      Size  ");
     outputWindowPrint("--------------------------------------------------------------------------------------------------------");
 
-    bx::MemoryReader reader(data, dataSize);
+    dm::MemoryReader reader(data, dataSize);
     const uint64_t totalBefore = reader.seek(0, bx::Whence::Current);
 
     // Keep track of loaded meshes.
@@ -308,13 +310,13 @@ bool projectLoad(const char* _path
         case CMFTSTUDIO_CHUNK_MAGIC_MSH_BEGIN:
             {
                 const uint64_t before = reader.seek(0, bx::Whence::Current);
-                const cs::MeshHandle mesh = cs::readMesh(&reader);
+                const cs::MeshHandle mesh = cs::readMesh(&reader, _stackAlloc);
                 meshList.add(mesh);
                 const uint64_t after = reader.seek(0, bx::Whence::Current);
 
                 uint32_t end;
                 bx::read(&reader, end);
-                BX_CHECK(CMFTSTUDIO_CHUNK_MAGIC_MSH_END == end, "Error reading file!");
+                DM_CHECK(CMFTSTUDIO_CHUNK_MAGIC_MSH_END == end, "Error reading file!");
 
                 const uint64_t size = after-before;
                 outputWindowPrint("[Mesh]     %79s - %4u.%03u MB", cs::getName(mesh), dm::U_UMB(size), size);
@@ -328,20 +330,20 @@ bool projectLoad(const char* _path
 
                 uint32_t end;
                 bx::read(&reader, end);
-                BX_CHECK(CMFTSTUDIO_CHUNK_MAGIC_MIN_END == end, "Error reading file!");
+                DM_CHECK(CMFTSTUDIO_CHUNK_MAGIC_MIN_END == end, "Error reading file!");
             }
         break;
 
         case CMFTSTUDIO_CHUNK_MAGIC_ENV_BEGIN:
             {
                 const uint64_t before = reader.seek(0, bx::Whence::Current);
-                const cs::EnvHandle env = cs::readEnv(&reader);
+                const cs::EnvHandle env = cs::readEnv(&reader, _stackAlloc);
                 _envList.add(env);
                 const uint64_t after = reader.seek(0, bx::Whence::Current);
 
                 uint32_t end;
                 bx::read(&reader, end);
-                BX_CHECK(CMFTSTUDIO_CHUNK_MAGIC_ENV_END == end, "Error reading file!");
+                DM_CHECK(CMFTSTUDIO_CHUNK_MAGIC_ENV_END == end, "Error reading file!");
 
                 const uint64_t size = after-before;
                 outputWindowPrint("[Env]      %79s - %4u.%03u MB", cs::getName(env), dm::U_UMB(size), size);
@@ -351,13 +353,13 @@ bool projectLoad(const char* _path
         case CMFTSTUDIO_CHUNK_MAGIC_MAT_BEGIN:
             {
                 const uint64_t before = reader.seek(0, bx::Whence::Current);
-                const cs::MaterialHandle material = cs::readMaterial(&reader);
+                const cs::MaterialHandle material = cs::readMaterial(&reader, _stackAlloc);
                 _materialList.add(material);
                 const uint64_t after = reader.seek(0, bx::Whence::Current);
 
                 uint32_t end;
                 bx::read(&reader, end);
-                BX_CHECK(CMFTSTUDIO_CHUNK_MAGIC_MAT_END == end, "Error reading file!");
+                DM_CHECK(CMFTSTUDIO_CHUNK_MAGIC_MAT_END == end, "Error reading file!");
 
                 const uint64_t size = after-before;
                 outputWindowPrint("[Material] %79s - %4u.%03u MB", cs::getName(material), dm::U_UMB(size), size);
@@ -367,13 +369,13 @@ bool projectLoad(const char* _path
         case CMFTSTUDIO_CHUNK_MAGIC_TEX_BEGIN:
             {
                 const uint64_t before = reader.seek(0, bx::Whence::Current);
-                const cs::TextureHandle texture = cs::readTexture(&reader);
+                const cs::TextureHandle texture = cs::readTexture(&reader, _stackAlloc);
                 _textureList.add(texture);
                 const uint64_t after = reader.seek(0, bx::Whence::Current);
 
                 uint32_t end;
                 bx::read(&reader, end);
-                BX_CHECK(CMFTSTUDIO_CHUNK_MAGIC_TEX_END == end, "Error reading file!");
+                DM_CHECK(CMFTSTUDIO_CHUNK_MAGIC_TEX_END == end, "Error reading file!");
 
                 const uint64_t size = after-before;
                 outputWindowPrint("[Texture]  %79s - %4u.%03u MB", cs::getName(texture), dm::U_UMB(size), size);
@@ -386,7 +388,7 @@ bool projectLoad(const char* _path
 
                 uint32_t end;
                 bx::read(&reader, end);
-                BX_CHECK(CMFTSTUDIO_CHUNK_MAGIC_SET_END == end, "Error reading file!");
+                DM_CHECK(CMFTSTUDIO_CHUNK_MAGIC_SET_END == end, "Error reading file!");
             }
         break;
 
@@ -398,7 +400,7 @@ bool projectLoad(const char* _path
 
         default:
             {
-                CS_CHECK(0, "Error reading project file! %08x at %ld", chunk, reader.seek(0, bx::Whence::Current));
+                CS_CHECK(0, "Error reading project file! %08x at %lld", chunk, reader.seek(0, bx::Whence::Current));
                 done = true;
             }
         break;
@@ -422,7 +424,7 @@ bool projectLoad(const char* _path
         cs::release(meshList[ii]);
     }
 
-    BX_FREE(_stackAlloc, data);
+    DM_FREE(_stackAlloc, data);
 
     return true;
 }

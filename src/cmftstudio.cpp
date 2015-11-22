@@ -14,7 +14,8 @@
 #include "common/timer.h"
 #include "common/datastructures.h"
 
-#include "geometry.h"
+#include "geometry/loaders.h"
+
 #include "backgroundjobs.h"
 #include "context.h"
 #include "assets.h"
@@ -605,7 +606,7 @@ struct ModelScene
                  , m_inst->m_pos[2]
                  );
 
-        submitMesh(_viewId, m_inst->m_mesh, _prog, mtx, m_inst->m_materials, _environment);
+        submitMesh(_viewId, m_inst->m_mesh, _prog, mtx, m_inst->m_materials.elements(), _environment);
     }
 
     cs::MeshInstance& getCurrInstance()
@@ -665,7 +666,7 @@ struct SpheresScene
 
         m_sphere = cs::meshSphere();
 
-        m_material[Material::Plain]   = cs::materialCreatePlain();
+        m_material[Material::Plain]   = cs::materialCreateShiny();
         m_material[Material::Stripes] = cs::materialCreateStripes();
         m_material[Material::Brick]   = cs::materialCreateBricks();
 
@@ -1210,7 +1211,7 @@ private:
         outputWindowPrint("---------------------------------------------------------------------------------------------------------");
 
         char path[DM_PATH_LEN];
-        bx::snprintf(path, sizeof(path), "%s\\%s", _widget.m_directory, _widget.m_outputName);
+        bx::snprintf(path, sizeof(path), "%s" DM_DIRSLASH "%s", _widget.m_directory, _widget.m_outputName);
 
         const bool saved = cmft::imageSave(output
                                          , path
@@ -1235,7 +1236,7 @@ private:
             bx::snprintf(msg, sizeof(msg), "Saving '%s' failed.", _widget.m_outputNameExt);
             imguiStatusMessage(msg, 6.0f, true, "Close");
 
-            outputWindowPrint("Saving failed!");
+            outputWindowPrint("Saving '%s' failed!", _widget.m_outputNameExt);
         }
     }
 
@@ -1327,21 +1328,21 @@ private:
                 m_materialList.add(cpy);
 
                 // Assign the newly created material.
-                instance.set(cpy, instance.m_selectedGroup);
+                instance.set(cpy, instance.m_selGroup);
 
             }
             // Handle material creation.
             else if (LeftScrollAreaState::CreateMaterial == m_widgets.m_leftScrollArea.m_action)
             {
                 // Create a plain material.
-                const cs::MaterialHandle mat = cs::materialCreatePlain();
+                const cs::MaterialHandle mat = cs::materialCreateShiny();
                 cs::setName(mat, "Unnamed");
 
                 // Add to the list.
                 m_materialList.add(mat);
 
                 // Assign the newly created material.
-                instance.set(mat, instance.m_selectedGroup);
+                instance.set(mat, instance.m_selGroup);
             }
         }
 
@@ -1389,7 +1390,7 @@ private:
                 {
                     const cs::TextureHandle texture = m_textureList[m_widgets.m_texPicker[matTex].m_selection];
 
-                    cs::Material& material = cs::getObj(instance.m_materials[instance.m_selectedGroup]);
+                    cs::Material& material = cs::getObj(instance.m_materials[instance.m_selGroup]);
                     material.set(matTex, texture);
                 }
                 else if (TexPickerWidgetState::Remove == m_widgets.m_texPicker[matTex].m_action)
@@ -1427,17 +1428,14 @@ private:
 
                 if ('\0' != file.m_path[0])
                 {
-                    if (0 == strcmp("dds", file.m_ext)
-                    ||  0 == strcmp("ktx", file.m_ext)
-                    ||  0 == strcmp("pvr", file.m_ext))
-                    {
-                        const cs::TextureHandle texture = cs::textureLoad(file.m_path);
-                        cs::setName(texture, file.m_name);
-                        m_textureList.add(texture);
-                        m_widgets.m_texPicker[m_widgets.m_textureBrowser.m_texPickerFor].m_selection = m_textureList.count()-1;
-                    }
+                    const cs::TextureHandle texture = cs::textureLoad(file.m_path);
+                    cs::setName(texture, file.m_name);
+                    m_textureList.add(texture);
+                    m_widgets.m_texPicker[m_widgets.m_textureBrowser.m_texPickerFor].m_selection = m_textureList.count()-1;
                 }
             }
+
+            m_widgets.m_textureBrowser.m_files.reset();
         }
 
         // CmftInfoSkybox action.
@@ -1614,6 +1612,7 @@ private:
                          , m_widgets.m_tonemapWidget.m_minLum
                          , m_widgets.m_tonemapWidget.m_lumRange
                          );
+                imguiStatusMessage("Tonemap operator applied!", 3.0f, false);
             }
         }
 
@@ -1666,7 +1665,7 @@ private:
         if (guiEvent(GuiEvent::HandleAction, m_widgets.m_meshSave.m_events))
         {
             char meshPath[DM_PATH_LEN];
-            bx::snprintf(meshPath, sizeof(meshPath), "%s\\%s.bin"
+            bx::snprintf(meshPath, sizeof(meshPath), "%s" DM_DIRSLASH "%s.bin"
                        , m_widgets.m_meshSave.m_directory
                        , m_widgets.m_meshSave.m_outputName
                        );
@@ -1691,9 +1690,40 @@ private:
         {
             if ('\0' != m_widgets.m_meshBrowser.m_filePath[0])
             {
-                if (0 == strcmp("bin", m_widgets.m_meshBrowser.m_fileExt))
+                // Obj loading is taking a long time, do it in a background thread.
+                if (0 == strcmp("obj", m_widgets.m_meshBrowser.m_fileExt))
+                {
+                    if (!m_backgroundThread.isRunning() && ThreadStatus::Idle == m_threadParams.m_cmftFilter.m_threadStatus)
+                    {
+                        // Setup parameters.
+                        CS_CHECK(sizeof(m_threadParams.m_modelLoad.m_userData) >= sizeof(ObjInData), "Array overflow!");
+                        ObjInData* obj = (ObjInData*)m_threadParams.m_modelLoad.m_userData;
+                        obj->m_scale       = 1.0f;
+                        obj->m_packUv      = 1;
+                        obj->m_packNormal  = 1;
+                        obj->m_ccw         = m_widgets.m_meshBrowser.m_ccw;
+                        obj->m_flipV       = m_widgets.m_meshBrowser.m_flipV;
+                        obj->m_calcTangent = true;
+
+                        dm::strscpya(m_threadParams.m_modelLoad.m_filePath, m_widgets.m_meshBrowser.m_filePath);
+                        dm::strscpya(m_threadParams.m_modelLoad.m_fileName, m_widgets.m_meshBrowser.m_fileName);
+
+                        // Acquire stack allocator for this thread.
+                        m_threadParams.m_modelLoad.m_stackAlloc = dm::allocSplitStack(DM_MEGABYTES(200), DM_MEGABYTES(400));
+
+                        // Start thread.
+                        m_backgroundThread.init(modelLoadFunc, (void*)&m_threadParams.m_modelLoad);
+                    }
+                    else
+                    {
+                        const char* msg = "Mesh could not be converted right now. Background thread is in use!";
+                        imguiStatusMessage(msg, 6.0f, true, "Close");
+                    }
+                }
+                else // Load mesh in this thread.
                 {
                     const cs::MeshHandle mesh = cs::meshLoad(m_widgets.m_meshBrowser.m_filePath);
+                    cs::createGpuBuffers(mesh);
                     cs::setName(mesh, m_widgets.m_meshBrowser.m_fileName);
 
                     cs::MeshInstance* inst = m_meshInstList.addNew();
@@ -1720,42 +1750,20 @@ private:
                     m_settings.m_selectedMeshIdx = m_meshInstList.count()-1;
                     m_modelScene.changeModel(m_meshInstList[m_settings.m_selectedMeshIdx]);
                 }
-                else if (0 == strcmp("obj", m_widgets.m_meshBrowser.m_fileExt))
-                {
-                    if (!m_backgroundThread.isRunning() && ThreadStatus::Idle == m_threadParams.m_cmftFilter.m_threadStatus)
-                    {
-                        // Setup parameters.
-                        m_threadParams.m_objToBin.m_flipV = m_widgets.m_meshBrowser.m_flipV;
-                        m_threadParams.m_objToBin.m_ccw   = m_widgets.m_meshBrowser.m_ccw;
-                        dm::strscpya(m_threadParams.m_objToBin.m_filePath, m_widgets.m_meshBrowser.m_filePath);
-                        dm::strscpya(m_threadParams.m_objToBin.m_fileName, m_widgets.m_meshBrowser.m_fileName);
-
-                        // Acquire stack allocator for this thread.
-                        m_threadParams.m_objToBin.m_stackAlloc = cs::allocSplitStack(DM_MEGABYTES(200), DM_MEGABYTES(400));
-
-                        // Start thread.
-                        m_backgroundThread.init(objToBinFunc, (void*)&m_threadParams.m_objToBin);
-                    }
-                    else
-                    {
-                        const char* msg = "Mesh could not be converted right now. Background thread is in use!";
-                        imguiStatusMessage(msg, 6.0f, true, "Close");
-                    }
-                }
             }
         }
 
-        // ObjToBin thread result.
-        if (ThreadStatus::Completed & m_threadParams.m_objToBin.m_threadStatus)
+        // ModelLoad thread result.
+        if (ThreadStatus::Completed & m_threadParams.m_modelLoad.m_threadStatus)
         {
             char buf[128];
 
-            if (m_threadParams.m_objToBin.m_threadStatus & ThreadStatus::ExitSuccess
-            &&  0 != m_threadParams.m_objToBin.m_size)
+            if (m_threadParams.m_modelLoad.m_threadStatus & ThreadStatus::ExitSuccess)
             {
-                // Load mesh from converted data.
-                const cs::MeshHandle mesh = cs::meshLoad(m_threadParams.m_objToBin.m_data, m_threadParams.m_objToBin.m_size);
-                cs::setName(mesh, m_threadParams.m_objToBin.m_fileName);
+                // Setup mesh.
+                const cs::MeshHandle mesh = m_threadParams.m_modelLoad.m_mesh;
+                cs::createGpuBuffers(mesh);
+                cs::setName(mesh, m_threadParams.m_modelLoad.m_fileName);
 
                 cs::MeshInstance* inst = m_meshInstList.addNew();
                 inst->set(mesh);
@@ -1768,7 +1776,7 @@ private:
                     const cs::MaterialHandle material = cs::materialCreatePlain();
 
                     // Assign name.
-                    bx::snprintf(buf, sizeof(buf), "%s - %u", m_threadParams.m_objToBin.m_fileName, ii);
+                    bx::snprintf(buf, sizeof(buf), "%s - %u", m_threadParams.m_modelLoad.m_fileName, ii);
                     cs::setName(material, buf);
 
                     // Add to list.
@@ -1781,31 +1789,24 @@ private:
                 m_settings.m_selectedMeshIdx = m_meshInstList.count()-1;
                 m_modelScene.changeModel(m_meshInstList[m_settings.m_selectedMeshIdx]);
 
-                imguiRemoveStatusMessage(StatusWindowId::MeshConversion);
-                bx::snprintf(buf, sizeof(buf), "Mesh '%s' loaded successfully.", m_threadParams.m_objToBin.m_fileName);
+                bx::snprintf(buf, sizeof(buf), "Mesh '%s' loaded successfully.", m_threadParams.m_modelLoad.m_fileName);
                 imguiStatusMessage(buf, 3.0f, false, "Close");
             }
             else
             {
-                bx::snprintf(buf, sizeof(buf), "Mesh '%s' loading failed!", m_threadParams.m_objToBin.m_fileName);
+                bx::snprintf(buf, sizeof(buf), "Mesh '%s' loading failed!", m_threadParams.m_modelLoad.m_fileName);
                 imguiStatusMessage(buf, 6.0f, true, "Close");
             }
 
-            // Free converted mesh data.
-            if (NULL != m_threadParams.m_objToBin.m_data)
-            {
-                BX_FREE(m_threadParams.m_objToBin.m_stackAlloc
-                      , m_threadParams.m_objToBin.m_data);
-                m_threadParams.m_objToBin.m_data = NULL;
-            }
+            imguiRemoveStatusMessage(StatusWindowId::MeshConversion);
 
             // Cleanup.
             if (m_backgroundThread.isRunning())
             {
                 m_backgroundThread.shutdown();
             }
-            m_threadParams.m_objToBin.m_threadStatus = ThreadStatus::Idle;
-            cs::allocFreeStack(m_threadParams.m_objToBin.m_stackAlloc);
+            m_threadParams.m_modelLoad.m_threadStatus = ThreadStatus::Idle;
+            dm::allocFreeStack(m_threadParams.m_modelLoad.m_stackAlloc);
         }
 
         // ProjectWindow action.
@@ -1821,7 +1822,7 @@ private:
                     dm::strscpya(m_threadParams.m_projectLoad.m_name, m_widgets.m_projectWindow.m_load.m_fileName);
 
                     // Acquire stack allocator for this thread.
-                    m_threadParams.m_projectLoad.m_stackAlloc = cs::allocSplitStack(DM_MEGABYTES(800), DM_MEGABYTES(400));
+                    m_threadParams.m_projectLoad.m_stackAlloc = dm::allocSplitStack(DM_MEGABYTES(800), DM_MEGABYTES(400));
 
                     // Start background thread.
                     m_backgroundThread.init(projectLoadFunc, (void*)&m_threadParams.m_projectLoad);
@@ -1848,17 +1849,20 @@ private:
                     }
                     for (uint16_t ii = 0, end = m_meshInstList.count(); ii < end; ++ii)
                     {
-                        m_threadParams.m_projectSave.m_meshInstList.add(m_meshInstList[ii]);
+                        m_threadParams.m_projectSave.m_meshInstList.add(cs::acquire(m_meshInstList[ii]));
                     }
                     m_threadParams.m_projectSave.m_compressionLevel = int32_t(m_widgets.m_projectWindow.m_compressionLevel);
                     memcpy(&m_threadParams.m_projectSave.m_settings, &m_settings, sizeof(Settings));
                     bx::snprintf(m_threadParams.m_projectSave.m_path
                                , sizeof(m_threadParams.m_projectSave.m_path)
-                               , "%s\\%s.csp"
+                               , "%s" DM_DIRSLASH "%s.csp"
                                , m_widgets.m_projectWindow.m_save.m_directory
                                , m_widgets.m_projectWindow.m_projectName
                                );
                     dm::strscpya(m_threadParams.m_projectSave.m_name, m_widgets.m_projectWindow.m_save.m_fileName);
+
+                    // Acquire stack allocator for this thread.
+                    m_threadParams.m_projectSave.m_stackAlloc = dm::allocSplitStack(DM_MEGABYTES(200), DM_MEGABYTES(400));
 
                     // Start background thread.
                     m_backgroundThread.init(projectSaveFunc, (void*)&m_threadParams.m_projectSave);
@@ -1895,6 +1899,7 @@ private:
             }
             m_threadParams.m_projectSave.m_threadStatus = ThreadStatus::Idle;
             m_threadParams.m_projectSave.releaseAll();
+            dm::allocFreeStack(m_threadParams.m_projectSave.m_stackAlloc);
         }
 
         // ProjectLoad thread result.
@@ -1904,6 +1909,11 @@ private:
             if (threadStatus(ThreadStatus::ExitSuccess, m_threadParams.m_projectLoad.m_threadStatus))
             {
                 eventTrigger(Event::ProjectLoaded);
+                m_threadParams.m_projectLoad.m_threadStatus = ThreadStatus::Halted;
+            }
+            else if (threadStatus(ThreadStatus::ExitFailure, m_threadParams.m_projectLoad.m_threadStatus))
+            {
+                m_threadParams.m_projectLoad.m_threadStatus = ThreadStatus::Idle;
             }
 
             // Update status message.
@@ -2024,9 +2034,11 @@ public:
             return;
         }
 
+        configFromDefaultPaths(g_config);
+
         // Setup allocator.
-        cs::allocInit();
-        cmft::setAllocator(cs::g_mainAlloc);
+        dm::allocInit();
+        cmft::setAllocator(dm::mainAlloc);
 
         const double splashScreenDuration = 1.5;
         const float modalWindowAnimDuration = 0.06f;
@@ -2045,7 +2057,7 @@ public:
         configFromCli(g_config, _argc, _argv);
 
         // Init bgfx.
-        bgfx::init(g_config.m_renderer, NULL, cs::g_bgfxAlloc);
+        bgfx::init(g_config.m_renderer, BGFX_PCI_ID_NONE, 0, NULL, cs::bgfxAlloc);
 
         uint32_t reset = BGFX_RESET_VSYNC;
         bgfx::reset(g_config.m_width, g_config.m_height, reset);
@@ -2082,7 +2094,7 @@ public:
 
         // Draw splash screen.
         initVertexDecls();
-        const cs::TextureHandle splashTex = cs::textureLoad(g_loadingScreenTex, g_loadingScreenTexSize);
+        const cs::TextureHandle splashTex = cs::textureLoadRaw(g_loadingScreenTex, g_loadingScreenTexSize);
         drawSplashScreen(splashTex, g_config.m_width, g_config.m_height);
         bx::sleep(100);
 
@@ -2130,7 +2142,7 @@ public:
         // Make sure there is at least one material.
         if (m_materialList.count() == 0)
         {
-            cs::MaterialHandle plain = cs::materialCreatePlain();
+            cs::MaterialHandle plain = cs::materialCreateShiny();
             cs::setName(plain, "Plain");
             m_materialList.add(plain);
 
@@ -2271,7 +2283,8 @@ public:
                 for (uint16_t ii = 0, end = m_threadParams.m_projectLoad.m_meshInstList.count(); ii < end; ++ii)
                 {
                     const cs::MeshInstance& inst = m_threadParams.m_projectLoad.m_meshInstList[ii];
-                    memcpy(m_meshInstList.addNew(), &inst, sizeof(cs::MeshInstance));
+                    cs::MeshInstance* cpy = m_meshInstList.addNew();
+                    cpy = new (cpy) cs::MeshInstance(inst);
                 }
                 for (uint16_t ii = 0, end = m_threadParams.m_projectLoad.m_envList.count(); ii < end; ++ii)
                 {
@@ -2300,7 +2313,7 @@ public:
                 // Cleanup.
                 m_threadParams.m_projectLoad.reset();
                 m_threadParams.m_projectLoad.m_threadStatus = ThreadStatus::Idle;
-                cs::allocFreeStack(m_threadParams.m_projectLoad.m_stackAlloc);
+                dm::allocFreeStack(m_threadParams.m_projectLoad.m_stackAlloc);
 
                 stateEnter(State::ProjectLoadTransition);
             }
@@ -2588,24 +2601,25 @@ public:
 
         bgfx::shutdown();
 
+        dm::allocPrintStats();
         cs::allocDestroy();
     }
 
 private:
     void initLists()
     {
-        const uint32_t totalSize = m_textureList.sizeFor(CmftStudio::MaxTextures)
-                                 + m_materialList.sizeFor(CmftStudio::MaxMaterials)
-                                 + m_envList.sizeFor(CmftStudio::MaxEnvironments)
-                                 + m_meshInstList.sizeFor(CmftStudio::MaxInstances)
+        const uint32_t totalSize = m_textureList.sizeFor(CS_MAX_TEXTURES)
+                                 + m_materialList.sizeFor(CS_MAX_MATERIALS)
+                                 + m_envList.sizeFor(CS_MAX_ENVIRONMENTS)
+                                 + m_meshInstList.sizeFor(CS_MAX_MESHINSTANCES)
                                  ;
-        m_listMem = BX_ALLOC(cs::g_staticAlloc, totalSize);
+        m_listMem = BX_ALLOC(dm::staticAlloc, totalSize);
 
         void* mem = m_listMem;
-        mem = m_textureList.init(CmftStudio::MaxTextures, mem);
-        mem = m_materialList.init(CmftStudio::MaxMaterials, mem);
-        mem = m_envList.init(CmftStudio::MaxEnvironments, mem);
-        mem = m_meshInstList.init(CmftStudio::MaxInstances, mem);
+        mem = m_textureList.init(CS_MAX_TEXTURES,       mem, dm::staticAlloc);
+        mem = m_materialList.init(CS_MAX_MATERIALS,     mem, dm::staticAlloc);
+        mem = m_envList.init(CS_MAX_ENVIRONMENTS,       mem, dm::staticAlloc);
+        mem = m_meshInstList.init(CS_MAX_MESHINSTANCES, mem, dm::staticAlloc);
     }
 
     void destroyLists()
@@ -2615,7 +2629,7 @@ private:
         m_envList.destroy();
         m_meshInstList.destroy();
 
-        BX_FREE(cs::g_staticAlloc, m_listMem);
+        BX_FREE(dm::staticAlloc, m_listMem);
     }
 
     // Resources.
@@ -2672,7 +2686,7 @@ private:
         ProjectSaveThreadParams m_projectSave;
         ProjectLoadThreadParams m_projectLoad;
         CmftFilterThreadParams  m_cmftFilter;
-        ObjToBinThreadParams    m_objToBin;
+        ModelLoadThreadParams   m_modelLoad;
     };
     ThreadParams m_threadParams;
     bx::Thread m_backgroundThread;

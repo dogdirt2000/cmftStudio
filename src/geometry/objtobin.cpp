@@ -3,15 +3,16 @@
  * License: http://www.opensource.org/licenses/BSD-2-Clause
  */
 
-#include "common/common.h"
-#include "geometry.h"
+#include "../common/common.h"
+#include "objtobin.h"
 
-#include "guimanager.h"
+#include "../guimanager.h"
 #define CS_PRINT(...) printf(__VA_ARGS__); outputWindowPrint(__VA_ARGS__)
 
-#include "common/utils.h"
-#include "common/memblock.h"
-#include <dm/misc.h> //dm::NoCopyNoAssign
+#include "geometry.h"           // write(vertices, indices..)
+#include "../common/utils.h"
+#include "../common/memblock.h"
+#include <dm/misc.h>            // dm::NoCopyNoAssign
 
 // This code is altered from: https://github.com/bkaradzic/bgfx/blob/master/tools/geometryc/geometryc.cpp
 /*
@@ -19,7 +20,8 @@
  * License: http://www.opensource.org/licenses/BSD-2-Clause
  */
 
-#include <bgfx.h>
+#include <bgfx/bgfx.h>
+#include <bounds.h> //Aabb, Obb, Sphere
 #include <../../src/vertexdecl.h>
 
 #include <stdio.h>
@@ -28,8 +30,14 @@
 
 #include <string>
 #include <algorithm>
-#include <vector>
-#include <unordered_map>
+#if CS_OBJTOBIN_USES_TINYSTL
+#   include "../common/tinystl.h"
+#   define CS_STL stl
+#else
+#   include <vector>
+#   include <unordered_map>
+#   define CS_STL std
+#endif
 
 #include <forsythtriangleorderoptimizer.h>
 
@@ -50,7 +58,7 @@ struct Vector3
     float z;
 };
 
-typedef stl::vector<Vector3> Vector3Array;
+typedef CS_STL::vector<Vector3> Vector3Array;
 
 struct Index3
 {
@@ -60,14 +68,14 @@ struct Index3
     int32_t m_vertexIndex;
 };
 
-typedef stl::unordered_map<uint64_t, Index3> Index3Map;
+typedef CS_STL::unordered_map<uint64_t, Index3> Index3Map;
 
 struct Triangle
 {
     uint64_t m_index[3];
 };
 
-typedef stl::vector<Triangle> TriangleArray;
+typedef CS_STL::vector<Triangle> TriangleArray;
 
 struct MeshGroup
 {
@@ -77,9 +85,9 @@ struct MeshGroup
     std::string m_material;
 };
 
-typedef stl::vector<MeshGroup> GroupArray;
+typedef CS_STL::vector<MeshGroup> BgfxGroupArray;
 
-static uint32_t s_obbSteps = 17;
+typedef CS_STL::vector<Primitive> BgfxPrimitiveArray;
 
 #define BGFX_CHUNK_MAGIC_GEO BX_MAKEFOURCC('G', 'E', 'O', 0x0)
 #define BGFX_CHUNK_MAGIC_VB  BX_MAKEFOURCC('V', 'B', ' ', 0x1)
@@ -94,7 +102,7 @@ static void triangleReorder(uint16_t* _indices, uint32_t _numIndices, uint32_t _
     delete [] newIndexList;
 }
 
-static void calculateTangents(void* _vertices, uint32_t _numVertices, const bgfx::VertexDecl& _decl, const uint16_t* _indices, uint32_t _numIndices)
+static void calculateTangents(void* _vertices, uint16_t _numVertices, bgfx::VertexDecl _decl, const uint16_t* _indices, uint32_t _numIndices)
 {
     struct PosTexcoord
     {
@@ -195,70 +203,6 @@ static void calculateTangents(void* _vertices, uint32_t _numVertices, const bgfx
     delete [] tangents;
 }
 
-void write(bx::WriterI* _writer, const void* _vertices, uint32_t _numVertices, uint32_t _stride)
-{
-    Sphere maxSphere;
-    calcMaxBoundingSphere(maxSphere, _vertices, _numVertices, _stride);
-
-    Sphere minSphere;
-    calcMinBoundingSphere(minSphere, _vertices, _numVertices, _stride);
-
-    if (minSphere.m_radius > maxSphere.m_radius)
-    {
-        bx::write(_writer, maxSphere);
-    }
-    else
-    {
-        bx::write(_writer, minSphere);
-    }
-
-    Aabb aabb;
-    calcAabb(aabb, _vertices, _numVertices, _stride);
-    bx::write(_writer, aabb);
-
-    Obb obb;
-    calcObb(obb, _vertices, _numVertices, _stride, s_obbSteps);
-    bx::write(_writer, obb);
-}
-
-void write(bx::WriterI* _writer, const uint8_t* _vertices, uint32_t _numVertices, const bgfx::VertexDecl& _decl, const uint16_t* _indices, uint32_t _numIndices, const char* _material, const PrimitiveArray& _primitives)
-{
-    using namespace bx;
-    using namespace bgfx;
-
-    uint32_t stride = _decl.getStride();
-    write(_writer, BGFX_CHUNK_MAGIC_VB);
-    write(_writer, _vertices, _numVertices, stride);
-
-    write(_writer, _decl);
-
-    write(_writer, uint16_t(_numVertices) );
-    write(_writer, _vertices, _numVertices*stride);
-
-    write(_writer, BGFX_CHUNK_MAGIC_IB);
-    write(_writer, _numIndices);
-    write(_writer, _indices, _numIndices*2);
-
-    write(_writer, BGFX_CHUNK_MAGIC_PRI);
-    uint16_t nameLen = uint16_t(strlen(_material));
-    write(_writer, nameLen);
-    write(_writer, _material, nameLen);
-    write(_writer, uint16_t(_primitives.size() ) );
-
-    for (PrimitiveArray::const_iterator primIt = _primitives.begin(); primIt != _primitives.end(); ++primIt)
-    {
-        const Primitive& prim = *primIt;
-        nameLen = uint16_t(strlen(prim.m_name));
-        write(_writer, nameLen);
-        write(_writer, prim.m_name, nameLen);
-        write(_writer, prim.m_startIndex);
-        write(_writer, prim.m_numIndices);
-        write(_writer, prim.m_startVertex);
-        write(_writer, prim.m_numVertices);
-        write(_writer, &_vertices[prim.m_startVertex*stride], prim.m_numVertices, stride);
-    }
-}
-
 inline uint32_t rgbaToAbgr(uint8_t _r, uint8_t _g, uint8_t _b, uint8_t _a)
 {
     return (uint32_t(_r)<<0)
@@ -276,7 +220,7 @@ struct GroupSortByMaterial
     }
 };
 
-uint32_t objToBin(const char* _filePath
+uint32_t objToBin(const uint8_t* _objData
                 , bx::WriterSeekerI* _writer
                 , uint32_t _packUv
                 , uint32_t _packNormal
@@ -284,35 +228,19 @@ uint32_t objToBin(const char* _filePath
                 , bool _flipV
                 , bool _hasTangent
                 , float _scale
-                , uint32_t _obbSteps
                 )
 {
-    s_obbSteps = bx::uint32_min(bx::uint32_max(_obbSteps, 1), 90);
-
-    FILE* file = fopen(_filePath, "rb");
-    if (NULL == file)
-    {
-        CS_PRINT("Unable to open input file '%s'.", _filePath);
-        return 0;
-    }
-
     int64_t parseElapsed = -bx::getHPCounter();
     int64_t triReorderElapsed = 0;
 
     const int64_t begin = _writer->seek();
-
-    uint32_t size = (uint32_t)dm::fsize(file);
-    char* data = new char[size+1];
-    size = (uint32_t)fread(data, 1, size, file);
-    data[size] = '\0';
-    fclose(file);
 
     Vector3Array positions;
     Vector3Array normals;
     Vector3Array texcoords;
     Index3Map indexMap;
     TriangleArray triangles;
-    GroupArray groups;
+    BgfxGroupArray groups;
 
     uint32_t num = 0;
 
@@ -326,7 +254,7 @@ uint32_t objToBin(const char* _filePath
     uint32_t len = sizeof(commandLine);
     int argc;
     char* argv[64];
-    const char* next = data;
+    const char* next = (const char*)_objData;
     do
     {
         next = bx::tokenizeCommandLine(next, commandLine, len, argc, argv, BX_COUNTOF(argv), '\n');
@@ -344,11 +272,14 @@ uint32_t objToBin(const char* _filePath
                 Triangle triangle;
                 memset(&triangle, 0, sizeof(Triangle) );
 
+                const int numNormals   = (int)normals.size();
+                const int numTexcoords = (int)texcoords.size();
+                const int numPositions = (int)positions.size();
                 for (uint32_t edge = 0, numEdges = argc-1; edge < numEdges; ++edge)
                 {
                     Index3 index;
-                    index.m_texcoord = -1;
-                    index.m_normal = -1;
+                    index.m_texcoord = 0;
+                    index.m_normal = 0;
                     index.m_vertexIndex = -1;
 
                     char* vertex = argv[edge+1];
@@ -361,20 +292,23 @@ uint32_t objToBin(const char* _filePath
                         if (NULL != normal)
                         {
                             *normal++ = '\0';
-                            index.m_normal = atoi(normal)-1;
+                            const int nn = atoi(normal);
+                            index.m_normal = (nn < 0) ? nn+numNormals : nn-1;
                         }
 
-                        index.m_texcoord = atoi(texcoord)-1;
+                        const int tex = atoi(texcoord);
+                        index.m_texcoord = (tex < 0) ? tex+numTexcoords : tex-1;
                     }
 
-                    index.m_position = atoi(vertex)-1;
+                    const int pos = atoi(vertex);
+                    index.m_position = (pos < 0) ? pos+numPositions : pos-1;
 
                     uint64_t hash0 = index.m_position;
                     uint64_t hash1 = uint64_t(index.m_texcoord)<<20;
                     uint64_t hash2 = uint64_t(index.m_normal)<<40;
                     uint64_t hash = hash0^hash1^hash2;
 
-                    stl::pair<Index3Map::iterator, bool> result = indexMap.insert(stl::make_pair(hash, index) );
+                    CS_STL::pair<Index3Map::iterator, bool> result = indexMap.insert(CS_STL::make_pair(hash, index) );
                     if (!result.second)
                     {
                         Index3& oldIndex = result.first->second;
@@ -541,8 +475,6 @@ uint32_t objToBin(const char* _filePath
         group.m_numTriangles = 0;
     }
 
-    delete [] data;
-
     int64_t now = bx::getHPCounter();
     parseElapsed += now;
     int64_t convertElapsed = -now;
@@ -554,8 +486,8 @@ uint32_t objToBin(const char* _filePath
     bool hasTexcoord;
     {
         Index3Map::const_iterator it = indexMap.begin();
-        hasNormal = -1 != it->second.m_normal;
-        hasTexcoord = -1 != it->second.m_texcoord;
+        hasNormal   = 0 != it->second.m_normal;
+        hasTexcoord = 0 != it->second.m_texcoord;
 
         if (!hasTexcoord
         &&  texcoords.size() == positions.size() )
@@ -642,17 +574,17 @@ uint32_t objToBin(const char* _filePath
 
     std::string material = groups.begin()->m_material;
 
-    PrimitiveArray primitives;
+    BgfxPrimitiveArray primitives;
 
     Primitive prim;
     prim.m_startVertex = 0;
-    prim.m_startIndex = 0;
+    prim.m_startIndex  = 0;
 
     uint32_t positionOffset = decl.getOffset(bgfx::Attrib::Position);
-    uint32_t color0Offset = decl.getOffset(bgfx::Attrib::Color0);
+    uint32_t color0Offset   = decl.getOffset(bgfx::Attrib::Color0);
 
     uint32_t ii = 0;
-    for (GroupArray::const_iterator groupIt = groups.begin(); groupIt != groups.end(); ++groupIt, ++ii)
+    for (BgfxGroupArray::const_iterator groupIt = groups.begin(); groupIt != groups.end(); ++groupIt, ++ii)
     {
         for (uint32_t tri = groupIt->m_startTriangle, end = tri + groupIt->m_numTriangles; tri < end; ++tri)
         {
@@ -667,7 +599,7 @@ uint32_t objToBin(const char* _filePath
                 }
 
                 triReorderElapsed -= bx::getHPCounter();
-                for (PrimitiveArray::const_iterator primIt = primitives.begin(); primIt != primitives.end(); ++primIt)
+                for (BgfxPrimitiveArray::const_iterator primIt = primitives.begin(); primIt != primitives.end(); ++primIt)
                 {
                     const Primitive& prim = *primIt;
                     triangleReorder(indexData + prim.m_startIndex, prim.m_numIndices, numVertices, 32);
@@ -679,7 +611,16 @@ uint32_t objToBin(const char* _filePath
                     calculateTangents(vertexData, numVertices, decl, indexData, numIndices);
                 }
 
-                write(_writer, vertexData, numVertices, decl, indexData, numIndices, material.c_str(), primitives);
+                write(_writer
+                    , vertexData
+                    , numVertices
+                    , decl
+                    , indexData
+                    , numIndices
+                    , material.c_str()
+                    , primitives.data()
+                    , (uint32_t)primitives.size()
+                    );
                 primitives.clear();
 
                 for (Index3Map::iterator indexIt = indexMap.begin(); indexIt != indexMap.end(); ++indexIt)
@@ -765,7 +706,7 @@ uint32_t objToBin(const char* _filePath
     if (0 < primitives.size() )
     {
         triReorderElapsed -= bx::getHPCounter();
-        for (PrimitiveArray::const_iterator primIt = primitives.begin(); primIt != primitives.end(); ++primIt)
+        for (BgfxPrimitiveArray::const_iterator primIt = primitives.begin(); primIt != primitives.end(); ++primIt)
         {
             const Primitive& prim = *primIt;
             triangleReorder(indexData + prim.m_startIndex, prim.m_numIndices, numVertices, 32);
@@ -777,7 +718,7 @@ uint32_t objToBin(const char* _filePath
             calculateTangents(vertexData, numVertices, decl, indexData, numIndices);
         }
 
-        write(_writer, vertexData, numVertices, decl, indexData, numIndices, material.c_str(), primitives);
+        write(_writer, vertexData, numVertices, decl, indexData, numIndices, material.c_str(), primitives.data(), (uint32_t)primitives.size());
     }
 
     delete [] indexData;
@@ -804,26 +745,80 @@ uint32_t objToBin(const char* _filePath
     return dataSize;
 }
 
-void objToBin(const char* _filePath
-            , void*& _outData
-            , uint32_t& _outDataSize
-            , bx::ReallocatorI* _allocator
-            , uint32_t _packUv
-            , uint32_t _packNormal
-            , bool _ccw
-            , bool _flipV
-            , bool _hasTangent
-            , float _scale
-            , uint32_t _obbSteps
-            )
+uint32_t objToBin(const char* _filePath
+                , bx::WriterSeekerI* _writer
+                , uint32_t _packUv
+                , uint32_t _packNormal
+                , bool _ccw
+                , bool _flipV
+                , bool _hasTangent
+                , float _scale
+                )
+{
+    FILE* file = fopen(_filePath, "rb");
+    if (NULL == file)
+    {
+        CS_PRINT("Unable to open input file '%s'.", _filePath);
+        return 0;
+    }
+
+    uint32_t size = (uint32_t)dm::fsize(file);
+    char* data = new char[size+1];
+    size = (uint32_t)fread(data, 1, size, file);
+    data[size] = '\0';
+    fclose(file);
+
+    const uint32_t dataSize = objToBin((uint8_t*)data, _writer, _packUv, _packNormal, _ccw, _flipV, _hasTangent, _scale);
+
+    delete [] data;
+
+    return dataSize;
+}
+
+uint32_t objToBin(const char* _filePath
+                , void*& _outData
+                , uint32_t& _outDataSize
+                , bx::ReallocatorI* _allocator
+                , uint32_t _packUv
+                , uint32_t _packNormal
+                , bool _ccw
+                , bool _flipV
+                , bool _hasTangent
+                , float _scale
+                )
 {
     enum { InitialDataSize = DM_MEGABYTES(200) };
 
     DynamicMemoryBlockWriter writer(_allocator, InitialDataSize);
-    objToBin(_filePath, &writer, _packUv, _packNormal, _ccw, _flipV, _hasTangent, _scale, _obbSteps);
+    const uint32_t dataSize = objToBin(_filePath, &writer, _packUv, _packNormal, _ccw, _flipV, _hasTangent, _scale);
 
     _outData     = writer.getData();
     _outDataSize = writer.getDataSize();
+
+    return dataSize;
+}
+
+uint32_t objToBin(const uint8_t* _objData
+                , void*& _outData
+                , uint32_t& _outDataSize
+                , bx::ReallocatorI* _allocator
+                , uint32_t _packUv
+                , uint32_t _packNormal
+                , bool _ccw
+                , bool _flipV
+                , bool _hasTangent
+                , float _scale
+                )
+{
+    enum { InitialDataSize = DM_MEGABYTES(200) };
+
+    DynamicMemoryBlockWriter writer(_allocator, InitialDataSize);
+    const uint32_t dataSize = objToBin(_objData, &writer, _packUv, _packNormal, _ccw, _flipV, _hasTangent, _scale);
+
+    _outData     = writer.getData();
+    _outDataSize = writer.getDataSize();
+
+    return dataSize;
 }
 
 /* vim: set sw=4 ts=4 expandtab: */

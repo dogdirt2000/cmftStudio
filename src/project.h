@@ -31,6 +31,7 @@ bool projectSave(const char* _path
                , int32_t _compressionLevel = 6 /*from 0 to 10*/
                , OnValidFile _validFileCallback = NULL
                , OnInvalidFile _invalidFileCallback = NULL
+               , dm::StackAllocatorI* _stackAlloc = dm::stackAlloc
                );
 
 bool projectLoad(const char* _path
@@ -41,7 +42,7 @@ bool projectLoad(const char* _path
                , Settings& _settings
                , OnValidFile _validFileCallback = NULL
                , OnInvalidFile _invalidFileCallback = NULL
-               , cs::StackAllocatorI* _stackAlloc = cs::g_stackAlloc
+               , dm::StackAllocatorI* _stackAlloc = dm::stackAlloc
                );
 
 #endif // CMFTSTUDIO_PROJECT_H_HEADER_GUARD

@@ -12,8 +12,8 @@
 #include "common/cmft.h"            // cmft::Image
 #include "common/datastructures.h"
 
-#include <bgfx.h>                   // bgfx::TextureHandle
-#include <bx/readerwriter.h>        // bx::WriterI, bx::ReaderSeekerI
+#include <bgfx/bgfx.h>              // bgfx::TextureHandle
+#include <dm/readerwriter.h>        // bx::WriterI, bx::ReaderSeekerI
 
 namespace cs
 {
@@ -36,7 +36,6 @@ namespace cs
         };
     };
 
-    void                setProgram(Program::Enum _prog);
     bgfx::ProgramHandle getProgram(Program::Enum _prog);
 
     // Material.
@@ -95,8 +94,10 @@ namespace cs
         float* m_uniformSample[6];
     };
 
+    MaterialHandle materialDefault();
     MaterialHandle materialCreate();
     MaterialHandle materialCreatePlain();
+    MaterialHandle materialCreateShiny();
     MaterialHandle materialCreateStripes();
     MaterialHandle materialCreateBricks();
     MaterialHandle materialCreate(const float* _data
@@ -186,10 +187,10 @@ namespace cs
     Uniforms& getUniforms();
     void      submitUniforms();
 
-    static inline uint32_t bgfx_submit(uint8_t _id, int32_t _depth = 0)
+    static inline uint32_t bgfx_submit(uint8_t _viewId, Program::Enum _prog, int32_t _depth = 0)
     {
         submitUniforms();
-        return bgfx::submit(_id, _depth);
+        return bgfx::submit(_viewId, getProgram(_prog), _depth);
     }
 
 
@@ -209,16 +210,7 @@ namespace cs
     cs::TextureHandle   textureBricksAo();
     cs::TextureHandle   textureLoad(const char* _path);
     cs::TextureHandle   textureLoad(const void* _data, uint32_t _size);
-    bgfx::TextureHandle textureLoadPath(const char* _path
-                                      , uint32_t _flags = BGFX_TEXTURE_NONE
-                                      , uint8_t _skip = 0
-                                      , bgfx::TextureInfo* _info = NULL
-                                      );
-    bgfx::TextureHandle textureLoadMem(const void* _data, uint32_t _size
-                                     , uint32_t _flags = BGFX_TEXTURE_NONE
-                                     , uint8_t _skip = 0
-                                     , bgfx::TextureInfo* _info = NULL
-                                     );
+    cs::TextureHandle   textureLoadRaw(const void* _data, uint32_t _size);
     bgfx::TextureHandle textureGetBgfxHandle(cs::TextureHandle _handle);
 
 
@@ -232,9 +224,9 @@ namespace cs
 
     MeshHandle meshSphere();
     uint32_t   meshNumGroups(MeshHandle _mesh);
-    MeshHandle meshLoad(const void* _data, uint32_t _size);
-    MeshHandle meshLoad(const char* _filePath);
-    MeshHandle meshLoad(bx::ReaderSeekerI& _reader);
+    MeshHandle meshLoad(const void* _data, uint32_t _size, const char* _ext);
+    MeshHandle meshLoad(const char* _filePath, void* _userData = NULL, dm::StackAllocatorI* _stack = dm::stackAlloc);
+    MeshHandle meshLoad(dm::ReaderSeekerI& _reader, dm::StackAllocatorI* _stack = dm::stackAlloc);
     bool       meshSave(MeshHandle _mesh, const char* _filePath);
 
 
@@ -245,6 +237,7 @@ namespace cs
     {
         MeshInstance();
         MeshInstance(const MeshInstance& _other);
+        ~MeshInstance();
 
         void set(cs::MeshHandle _mesh);
         void set(cs::MaterialHandle _material, uint32_t _groupIdx = 0);
@@ -257,11 +250,12 @@ namespace cs
         float m_pos[3];
         float m_mtx[16];
         cs::MeshHandle m_mesh;
-        cs::MaterialHandle m_materials[CS_MAX_MESH_GROUPS];
-        uint16_t m_selectedGroup;
+        uint16_t m_selGroup;
+        dm::Array<MaterialHandle> m_materials;
     };
 
     MeshInstance* acquire(const MeshInstance* _inst);
+    MeshInstance& acquire(const MeshInstance& _inst);
     void          release(const MeshInstance* _inst);
 
 
@@ -293,7 +287,7 @@ namespace cs
     EnvHandle    envCreateCmftStudioLogo();
     EnvHandle    envCreate(uint32_t _rgba = 0x303030ff);
     EnvHandle    envCreate(const char* _skyboxPath, const char* _pmremPath, const char* _iemPath);
-    EnvHandle    envCreate(bx::ReaderSeekerI& _reader);
+    EnvHandle    envCreate(dm::ReaderSeekerI& _reader);
     void         envLoad(EnvHandle _handle, Environment::Enum _which, cmft::Image& _image); // Notice: this takes ownership of '_image'.
     bool         envLoad(EnvHandle _handle, Environment::Enum _which, const char* _filePath);
     void         envTransform_UseMacroInstead(EnvHandle _handle, Environment::Enum _which, ...);
@@ -319,6 +313,7 @@ namespace cs
     void resourceResolveAll();
     void resourceClearMappings();
 
+
     // Lists.
     //-----
 
@@ -340,6 +335,7 @@ namespace cs
     void listRemoveReleaseAll(EnvList& _list);
     void listRemoveReleaseAll(MeshInstanceList& _list);
 
+
     // Context.
     //-----
 
@@ -353,7 +349,7 @@ namespace cs
 
     void setTexture(TextureUniform::Enum _which, cs::TextureHandle _handle, uint32_t _flags = UINT32_MAX);
     void setTexture(TextureUniform::Enum _which, bgfx::TextureHandle _handle, uint32_t _flags = UINT32_MAX);
-    void setTexture(TextureUniform::Enum _which, bgfx::FrameBufferHandle _handle, uint8_t _attachment = 0, uint32_t _flags = UINT32_MAX);
+    void setTexture(TextureUniform::Enum _which, bgfx::FrameBufferHandle _handle, uint32_t _flags = UINT32_MAX, uint8_t _attachment = 0);
     void setMaterial(MaterialHandle _handle);
     void setEnv(EnvHandle _handle);
     void setEnvTransition(EnvHandle _from);
@@ -425,16 +421,14 @@ namespace cs
     void release(MeshHandle _handle);
     void release(EnvHandle _handle);
 
-    TextureHandle  readTexture(bx::ReaderSeekerI* _reader);
-    MaterialHandle readMaterial(bx::ReaderSeekerI* _reader);
-    MeshHandle     readMesh(bx::ReaderSeekerI* _reader);
-    EnvHandle      readEnv(bx::ReaderSeekerI* _reader);
-    void           readMeshInstance(bx::ReaderSeekerI* _reader, MeshInstance* _instance);
+    TextureHandle  readTexture(dm::ReaderSeekerI* _reader,dm::StackAllocatorI* _stack = dm::stackAlloc);
+    MaterialHandle readMaterial(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack = dm::stackAlloc);
+    MeshHandle     readMesh(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack = dm::stackAlloc);
+    EnvHandle      readEnv(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack = dm::stackAlloc);
+    void           readMeshInstance(dm::ReaderSeekerI* _reader, MeshInstance* _instance);
 
     /// Notice: after read*(), createGpuBuffers*() need to be called from the main thread.
-    void createGpuBuffers(TextureHandle _handle, uint32_t _flags = BGFX_TEXTURE_NONE, uint8_t _skip = 0, bgfx::TextureInfo* _info = NULL);
-    void createGpuBuffersTex2D(TextureHandle _handle, uint32_t _flags = BGFX_TEXTURE_U_CLAMP|BGFX_TEXTURE_V_CLAMP);
-    void createGpuBuffersCube(TextureHandle _handle, uint32_t _flags = BGFX_TEXTURE_U_CLAMP|BGFX_TEXTURE_V_CLAMP|BGFX_TEXTURE_W_CLAMP);
+    void createGpuBuffers(TextureHandle _handle, uint32_t _flags = BGFX_TEXTURE_NONE);
     void createGpuBuffers(MeshHandle _handle);
     void createGpuBuffers(EnvHandle _handle);
 

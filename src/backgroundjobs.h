@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #include "guimanager.h" // imguiEnqueueStatusMessage()
-#include "context.h"    // cs::*List
+#include "context.h"    // cs::*List, cs::MeshHandle
 #include "settings.h"   // Settings
 #include <dm/misc.h>    // DM_PATH_LEN
 
@@ -21,6 +21,7 @@ struct ThreadStatus
         Idle        = 0x00,
         Started     = 0x01,
         Completed   = 0x02,
+        Halted      = 0x04,
 
         ExitSuccess = 0x10,
         ExitFailure = 0x20,
@@ -45,20 +46,21 @@ struct ProjectSaveThreadParams
 {
     void init()
     {
+        m_stackAlloc       = NULL;
         m_compressionLevel = 6;
         m_threadStatus     = ThreadStatus::Idle;
         m_path[0]          = '\0';
         m_name[0]          = '\0';
 
-        const uint32_t size = cs::MaterialList::sizeFor(CmftStudio::MaxMaterials)
-                            + cs::EnvList::sizeFor(CmftStudio::MaxEnvironments)
-                            + cs::MeshInstanceList::sizeFor(CmftStudio::MaxInstances);
-        m_memBlock = BX_ALLOC(cs::g_staticAlloc, size);
+        const uint32_t size = cs::MaterialList::sizeFor(CS_MAX_MATERIALS)
+                            + cs::EnvList::sizeFor(CS_MAX_ENVIRONMENTS)
+                            + cs::MeshInstanceList::sizeFor(CS_MAX_MESHINSTANCES);
+        m_memBlock = DM_ALLOC(dm::staticAlloc, size);
 
         void* ptr = m_memBlock;
-        ptr = m_materialList.init(CmftStudio::MaxMaterials, ptr);
-        ptr = m_envList.init(CmftStudio::MaxEnvironments, ptr);
-        ptr = m_meshInstList.init(CmftStudio::MaxInstances, ptr);
+        ptr = m_materialList.init(CS_MAX_MATERIALS,     ptr, dm::staticAlloc);
+        ptr = m_envList.init(CS_MAX_ENVIRONMENTS,       ptr, dm::staticAlloc);
+        ptr = m_meshInstList.init(CS_MAX_MESHINSTANCES, ptr, dm::staticAlloc);
     }
 
     void releaseAll()
@@ -73,10 +75,11 @@ struct ProjectSaveThreadParams
         m_materialList.destroy();
         m_envList.destroy();
         m_meshInstList.destroy();
-        BX_FREE(cs::g_staticAlloc, m_memBlock);
+        DM_FREE(dm::staticAlloc, m_memBlock);
     }
 
     Settings m_settings;
+    dm::StackAllocatorI* m_stackAlloc;
     int32_t m_compressionLevel;
     uint8_t m_threadStatus;
     char m_path[DM_PATH_LEN];
@@ -101,17 +104,17 @@ struct ProjectLoadThreadParams
         m_path[0]      = '\0';
         m_name[0]      = '\0';
 
-        const uint32_t size = cs::TextureList::sizeFor(CmftStudio::MaxTextures)
-                            + cs::MaterialList::sizeFor(CmftStudio::MaxMaterials)
-                            + cs::EnvList::sizeFor(CmftStudio::MaxEnvironments)
-                            + cs::MeshInstanceList::sizeFor(CmftStudio::MaxInstances);
-        m_memBlock = BX_ALLOC(cs::g_staticAlloc, size);
+        const uint32_t size = cs::TextureList::sizeFor(CS_MAX_TEXTURES)
+                            + cs::MaterialList::sizeFor(CS_MAX_MATERIALS)
+                            + cs::EnvList::sizeFor(CS_MAX_ENVIRONMENTS)
+                            + cs::MeshInstanceList::sizeFor(CS_MAX_MESHINSTANCES);
+        m_memBlock = DM_ALLOC(dm::staticAlloc, size);
 
         void* ptr = m_memBlock;
-        ptr = m_textureList.init(CmftStudio::MaxTextures, ptr);
-        ptr = m_materialList.init(CmftStudio::MaxMaterials, ptr);
-        ptr = m_envList.init(CmftStudio::MaxEnvironments, ptr);
-        ptr = m_meshInstList.init(CmftStudio::MaxInstances, ptr);
+        ptr = m_textureList.init(CS_MAX_TEXTURES,       ptr, dm::staticAlloc);
+        ptr = m_materialList.init(CS_MAX_MATERIALS,     ptr, dm::staticAlloc);
+        ptr = m_envList.init(CS_MAX_ENVIRONMENTS,       ptr, dm::staticAlloc);
+        ptr = m_meshInstList.init(CS_MAX_MESHINSTANCES, ptr, dm::staticAlloc);
     }
 
     void reset()
@@ -128,11 +131,11 @@ struct ProjectLoadThreadParams
         m_materialList.destroy();
         m_envList.destroy();
         m_meshInstList.destroy();
-        BX_FREE(cs::g_staticAlloc, m_memBlock);
+        DM_FREE(dm::staticAlloc, m_memBlock);
     }
 
     Settings m_settings;
-    cs::StackAllocatorI* m_stackAlloc;
+    dm::StackAllocatorI* m_stackAlloc;
     uint8_t m_threadStatus;
     char m_path[DM_PATH_LEN];
     char m_name[128];
@@ -148,41 +151,26 @@ int32_t projectLoadFunc(void* _projectLoadThreadParams);
 // Mesh format conversion.
 //-----
 
-struct ObjToBinThreadParams
+struct ModelLoadThreadParams
 {
-    ObjToBinThreadParams()
+    ModelLoadThreadParams()
     {
+        m_mesh         = cs::MeshHandle::invalid();
         m_stackAlloc   = NULL;
         m_threadStatus = ThreadStatus::Idle;
-        m_scale        = 1.0f;
-        m_packUv       = 1;
-        m_packNormal   = 1;
-        m_obbSteps     = 17;
-        m_ccw          = false;
-        m_flipV        = false;
-        m_calcTangent  = true;
-        m_data         = NULL;
-        m_size         = 0;
         m_filePath[0]  = '\0';
         m_fileName[0]  = '\0';
     }
 
-    cs::StackAllocatorI* m_stackAlloc;
+    cs::MeshHandle m_mesh;
+    dm::StackAllocatorI* m_stackAlloc;
     uint8_t m_threadStatus;
-    float m_scale;
-    uint32_t m_packUv;
-    uint32_t m_packNormal;
-    uint32_t m_obbSteps;
-    bool m_ccw;
-    bool m_flipV;
-    bool m_calcTangent;
-    void* m_data;
-    uint32_t m_size;
-    char m_filePath[256];
+    char m_filePath[DM_PATH_LEN];
     char m_fileName[128];
+    uint8_t m_userData[sizeof(int32_t)*64];
 };
 
-int32_t objToBinFunc(void* _objToBinThreadParameters);
+int32_t modelLoadFunc(void* _modelLoadThreadParameters);
 
 // Cmft filter.
 //-----

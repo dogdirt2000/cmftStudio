@@ -35,6 +35,18 @@ newoption
 
 newoption
 {
+    trigger = "unity-build",
+    description = "Single compilation unit build.",
+}
+
+newoption
+{
+    trigger = "with-amalgamated",
+    description = "Enable amalgamated build.",
+}
+
+newoption
+{
     trigger = "with-sdl",
     description = "Enable SDL entry.",
 }
@@ -61,7 +73,15 @@ defines
     "BX_CONFIG_ENABLE_MSVC_LEVEL4_WARNINGS=1",
     "ENTRY_DEFAULT_WIDTH=1920",
     "ENTRY_DEFAULT_HEIGHT=1027",
+    "BGFX_CONFIG_RENDERER_OPENGL=21",
 }
+
+configuration { "vs* or mingw-*" }
+    defines
+    {
+        "BGFX_CONFIG_RENDERER_DIRECT3D9=1",
+        "BGFX_CONFIG_RENDERER_DIRECT3D11=1",
+    }
 
 configuration {}
 
@@ -132,6 +152,21 @@ project "cmftStudio"
         BGFX_DIR .. "3rdparty/forsyth-too/**.h",
         DM_DIR   .. "include/**.h",
     }
+
+    if _OPTIONS["unity-build"] then
+        excludes
+        {
+            CMFTSTUDIO_SRC_DIR .. "*.cpp",
+            CMFTSTUDIO_SRC_DIR .. "geometry/*.cpp",
+            CMFTSTUDIO_SRC_DIR .. "common/*.cpp",
+            CMFTSTUDIO_SRC_DIR .. "common/allocator/*.cpp",
+        }
+    else
+        excludes
+        {
+            CMFTSTUDIO_SRC_DIR .. "build/*.cpp",
+        }
+    end
 
     links
     {

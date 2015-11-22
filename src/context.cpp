@@ -7,21 +7,26 @@
 #include "context.h"
 
 #include <stdio.h>
-#include <string.h>          // strcpy
+#include <string.h>            // strcpy
+
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include "common/stb_image.h"
 
 #include "common/timer.h"
-#include "geometry.h"
+#include "geometry/loaders.h"
+#include "geometry/objtobin.h"
 #include "staticres.h"
 
-#include <dm/misc.h>         // DM_PATH_LEN, dm::fsize
+#include <bgfx_utils.h>        // loadProgram
+#include <common.h>            // DBG
+
+#include <dm/misc.h>           // DM_PATH_LEN, dm::fsize
+#include <dm/readerwriter.h>
 #include <dm/pi.h>
 
-#include <bgfx_utils.h>      // loadProgram
-#include <common.h>          // DBG
-
 #include <bx/fpumath.h>
-#include <bx/macros.h>       // BX_UNUSED
-#include <bx/readerwriter.h>
+#include <bx/macros.h>         // BX_UNUSED
 
 #ifndef CS_LOAD_SHADERS_FROM_DATA_SEGMENT
     #define CS_LOAD_SHADERS_FROM_DATA_SEGMENT 0
@@ -110,11 +115,6 @@ namespace cs
         #include "context_res.h"
     }
 
-    void setProgram(Program::Enum _prog)
-    {
-        bgfx::setProgram(s_programs[_prog]);
-    }
-
     bgfx::ProgramHandle getProgram(Program::Enum _prog)
     {
         return s_programs[_prog];
@@ -149,10 +149,10 @@ namespace cs
     {
         void init()
         {
-            u_uniforms = bgfx::createUniform("u_uniforms", bgfx::UniformType::Uniform4fv, Uniforms::Num);
+            u_uniforms = bgfx::createUniform("u_uniforms", bgfx::UniformType::Vec4, Uniforms::Num);
 
             #define TEXUNI_DESC(_enum, _stage, _name) \
-                u_tex[TextureUniform::_enum] = bgfx::createUniform(_name, bgfx::UniformType::Uniform1i);
+                u_tex[TextureUniform::_enum] = bgfx::createUniform(_name, bgfx::UniformType::Int1);
             #include "context_res.h"
         }
 
@@ -216,12 +216,12 @@ namespace cs
             return handle;
         }
 
-        TyHandle read(bx::ReaderSeekerI* _reader)
+        TyHandle read(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack = dm::stackAlloc)
         {
             TyImpl* impl = this->createObj();
 
             const TyHandle handle = this->getHandle(impl);
-            impl->read(_reader, handle);
+            impl->read(_reader, handle, _stack);
 
             return this->acquire(handle);
         }
@@ -248,7 +248,7 @@ namespace cs
 
         TyImpl* getImpl(TyHandle _handle)
         {
-            return m_elements.getObjFromHandle(_handle.m_idx);
+            return m_elements.get(_handle.m_idx);
         }
 
         Ty* getObj(TyHandle _handle)
@@ -397,10 +397,10 @@ namespace cs
         dm::KeyValueMapT<TyHandle, MaxT>        m_resourceMap;
         dm::ObjArrayT<UnresolvedResource, MaxT> m_unresolved;
     };
-    static ResourceResolver<TextureHandle, CS_MAX_TEXTURES>   s_textureResolver;
-    static ResourceResolver<MaterialHandle, CS_MAX_MATERIALS> s_materialResolver;
-    static ResourceResolver<MeshHandle, CS_MAX_MESHES>        s_meshResolver;
-    static ResourceResolver<EnvHandle, CS_MAX_ENVMAPS>        s_envResolver;
+    static ResourceResolver<TextureHandle,  CS_MAX_TEXTURES>      s_textureResolver;
+    static ResourceResolver<MaterialHandle, CS_MAX_MATERIALS>     s_materialResolver;
+    static ResourceResolver<MeshHandle,     CS_MAX_MESHES>        s_meshResolver;
+    static ResourceResolver<EnvHandle,      CS_MAX_ENVIRONMENTS>  s_envResolver;
 
     void resourceMap(uint16_t _id, TextureHandle _handle)
     {
@@ -486,7 +486,7 @@ namespace cs
     template <typename TyHandle>
     struct ReadWriteI
     {
-        void read(bx::ReaderSeekerI* /*_reader*/, TyHandle /*_handle*/)
+        void read(dm::ReaderSeekerI* /*_reader*/, dm::StackAllocatorI* /*_stack*/,  TyHandle /*_handle*/)
         {
             CS_CHECK(false, "Should be overridden!");
         }
@@ -552,15 +552,26 @@ namespace cs
 
     struct TextureImpl : public Texture, public ReadWriteI<TextureHandle>
     {
+        struct Type
+        {
+            enum Enum
+            {
+                Unknown,
+                Tex2D,
+                TexCube,
+            };
+        };
+
         TextureImpl()
         {
             m_bgfxHandle.idx = bgfx::invalidHandle;
-            m_size           = 0;
             m_data           = NULL;
+            m_size           = 0;
             m_numMips        = 0;
             m_width          = 0;
             m_height         = 0;
             m_format         = bgfx::TextureFormat::BGRA8;
+            m_type           = Type::Unknown;
             m_freeData       = true;
         }
 
@@ -569,62 +580,125 @@ namespace cs
             destroy();
         }
 
-        void load(const void* _data, uint32_t _size)
+        void loadRaw(const void* _data, uint32_t _size)
         {
-            m_data = BX_ALLOC(g_mainAlloc, _size);
+            m_data = BX_ALLOC(dm::mainAlloc, _size);
             memcpy(m_data, _data, _size);
             m_size = _size;
+            m_type = Type::Unknown;
+        }
+
+        bool load(const void* _dataOrPath, uint32_t _sizeOrInvalid)
+        {
+            const bool isFile = (UINT32_MAX == _sizeOrInvalid);
+
+            const char*    path = (const char*)_dataOrPath;
+            const void*    data = (const void*)_dataOrPath;
+            const uint32_t size = _sizeOrInvalid;
+
+            // Try loading the image through cmft.
+            cmft::Image image;
+            if (isFile)
+            {
+                cmft::imageLoad(image, path);
+            }
+            else
+            {
+                cmft::imageLoad(image, data, size);
+            }
+
+            if (cmft::imageIsValid(image))
+            {
+                cmft::ImageSoftRef imageBgfx;
+
+                const TextureFormatInfo tfi = cmftToBgfx(image.m_format);
+                if (tfi.convert())
+                {
+                    cmft::imageConvert(imageBgfx, tfi.cmftFormat(), image);
+                    cmft::imageUnload(image);
+                }
+                else
+                {
+                    cmft::imageRef(imageBgfx, image);
+                }
+
+                m_data     = imageBgfx.m_data;
+                m_size     = imageBgfx.m_dataSize;
+                m_numMips  = imageBgfx.m_numMips;
+                m_width    = (uint16_t)imageBgfx.m_width;
+                m_height   = (uint16_t)imageBgfx.m_height;
+                m_format   = cmftToBgfx(imageBgfx.m_format).bgfxFormat();
+                m_type     = imageBgfx.m_numFaces == 6 ? Type::TexCube : Type::Tex2D;
+                m_freeData = true;
+
+                return true;
+            }
+
+            // Try loading the image through stb_image.
+            int stbWidth, stbHeight, stbNumComponents;
+            // Passing reqNumComponents as 4 forces RGBA8 in m_data.
+            // After stbi_load, stbNumComponents will hold the actual # of components from the source image.
+            const int reqNumComponents = 4;
+            if (isFile)
+            {
+                m_data = (uint8_t*)stb::stbi_load(path, &stbWidth, &stbHeight, &stbNumComponents, reqNumComponents);
+            }
+            else
+            {
+                m_data = (uint8_t*)stb::stbi_load_from_memory((stb::stbi_uc*)data, (int)size, &stbWidth, &stbHeight, &stbNumComponents, reqNumComponents);
+            }
+
+            if (m_data)
+            {
+                m_size     = stbWidth*stbHeight*reqNumComponents;
+                m_numMips  = 1;
+                m_width    = (uint16_t)stbWidth;
+                m_height   = (uint16_t)stbHeight;
+                m_format   = bgfx::TextureFormat::RGBA8;
+                m_type     = Type::Tex2D;
+                m_freeData = true;
+
+                return true;
+            }
+
+            // Read/copy raw data.
+
+            if (isFile)
+            {
+                FILE* file = fopen(path, "rb");
+                if (NULL != file)
+                {
+                    m_size = (uint32_t)dm::fsize(file);
+                    m_data = BX_ALLOC(dm::mainAlloc, m_size);
+                    m_type = Type::Unknown;
+
+                    size_t read = fread(m_data, 1, m_size, file);
+                    CS_CHECK(read == m_size, "Error reading file.");
+                    BX_UNUSED(read);
+                    fclose(file);
+
+                    return true;
+                }
+            }
+            else
+            {
+                loadRaw(data, size);
+
+                return true;
+            }
+
+            return false;
         }
 
         bool load(const char* _path)
         {
-            FILE* file = fopen(_path, "rb");
-            if (NULL != file)
-            {
-                m_size = (uint32_t)dm::fsize(file);
-                m_data = BX_ALLOC(g_mainAlloc, m_size);
-
-                size_t read = fread(m_data, 1, m_size, file);
-                CS_CHECK(read == m_size, "Error reading file.");
-                BX_UNUSED(read);
-                fclose(file);
-
-                return true;
-            }
-
-            return false;
+            return load((void*)_path, UINT32_MAX);
         }
 
-        bool loadBgfxOnly(const char* _path, uint32_t _flags, uint8_t _skip, bgfx::TextureInfo* _info)
+        void read(dm::ReaderSeekerI* _reader, TextureHandle _handle = TextureHandle::invalid(), dm::StackAllocatorI* _stack = dm::stackAlloc)
         {
-            FILE* file = fopen(_path, "rb");
-            if (NULL != file)
-            {
-                uint32_t size = (uint32_t)dm::fsize(file);
-                const bgfx::Memory* mem = bgfx::alloc(size+1);
+            BX_UNUSED(_stack);
 
-                size_t read = fread(mem->data, 1, size, file);
-                mem->data[read] = '\0';
-                CS_CHECK(read == size, "Error reading file.");
-                BX_UNUSED(read);
-                fclose(file);
-
-                m_bgfxHandle = bgfx::createTexture(mem, _flags, _skip, _info);
-
-                return true;
-            }
-
-            return false;
-        }
-
-        void loadBgfxOnly(const void* _data, uint32_t _size, uint32_t _flags, uint8_t _skip, bgfx::TextureInfo* _info)
-        {
-            const bgfx::Memory* mem = bgfx::makeRef(_data, _size);
-            m_bgfxHandle = bgfx::createTexture(mem, _flags, _skip, _info);
-        }
-
-        void read(bx::ReaderSeekerI* _reader, TextureHandle _handle = TextureHandle::invalid())
-        {
             this->destroy();
 
             uint16_t id;
@@ -632,29 +706,40 @@ namespace cs
             resourceMap(id, _handle);
 
             bx::read(_reader, m_size);
-            m_data = (uint8_t*)BX_ALLOC(g_mainAlloc, m_size);
+            m_data = (uint8_t*)BX_ALLOC(dm::mainAlloc, m_size);
             bx::read(_reader, m_data, m_size);
         }
 
-        void createGpuBuffers(uint32_t _flags = BGFX_TEXTURE_NONE, uint8_t _skip = 0, bgfx::TextureInfo* _info = NULL)
+        void createGpuBuffers(uint32_t _flags = BGFX_TEXTURE_NONE)
         {
             const bgfx::Memory* mem = bgfx::makeRef(m_data, m_size);
             BGFX_SAFE_DESTROY_TEXTURE(m_bgfxHandle);
-            m_bgfxHandle = bgfx::createTexture(mem, _flags, _skip, _info);
-        }
 
-        void createGpuBuffersCube(uint32_t _flags = BGFX_TEXTURE_U_CLAMP|BGFX_TEXTURE_V_CLAMP|BGFX_TEXTURE_W_CLAMP)
-        {
-            const bgfx::Memory* mem = bgfx::makeRef(m_data, m_size);
-            BGFX_SAFE_DESTROY_TEXTURE(m_bgfxHandle);
-            m_bgfxHandle = bgfx::createTextureCube(m_width, m_numMips, m_format, _flags, mem);
-        }
+            switch (m_type)
+            {
+            case Type::Unknown:
+                {
+                    bgfx::TextureInfo info;
+                    m_bgfxHandle = bgfx::createTexture(mem, _flags, 0, &info);
 
-        void createGpuBuffersTex2D(uint32_t _flags = BGFX_TEXTURE_U_CLAMP|BGFX_TEXTURE_V_CLAMP)
-        {
-            const bgfx::Memory* mem = bgfx::makeRef(m_data, m_size);
-            BGFX_SAFE_DESTROY_TEXTURE(m_bgfxHandle);
-            m_bgfxHandle = bgfx::createTexture2D(m_width, m_height, m_numMips, m_format, _flags, mem);
+                    m_numMips  = info.numMips;
+                    m_width    = info.width;
+                    m_height   = info.height;
+                    m_format   = info.format;
+                    m_type     = info.cubeMap ? Type::TexCube : Type::Tex2D;
+                }
+            break;
+            case Type::Tex2D:
+                {
+                    m_bgfxHandle = bgfx::createTexture2D(m_width, m_height, m_numMips, m_format, _flags, mem);
+                }
+            break;
+            case Type::TexCube:
+                {
+                    m_bgfxHandle = bgfx::createTextureCube(m_width, m_numMips, m_format, _flags, mem);
+                }
+            break;
+            };
         }
 
         void write(bx::WriterI* _writer, uint16_t _id = ResourceId::Invalid) const
@@ -668,7 +753,7 @@ namespace cs
         {
             if (m_freeData && NULL != m_data)
             {
-                BX_FREE(_delayed ? g_delayedFree : g_mainAlloc, m_data);
+                BX_FREE(_delayed ? cs::delayedFree : dm::mainAlloc, m_data);
                 m_data = NULL;
             }
 
@@ -689,6 +774,7 @@ namespace cs
         uint16_t m_width;
         uint16_t m_height;
         bgfx::TextureFormat::Enum m_format;
+        Type::Enum m_type;
         bool m_freeData;
     };
 
@@ -698,6 +784,17 @@ namespace cs
         {
             const TextureImpl* texture = this->createObj();
             const TextureHandle handle = this->getHandle(texture);
+            return this->acquire(handle);
+        }
+
+        TextureHandle loadRaw(const void* _data, uint32_t _size)
+        {
+            TextureImpl* texture = this->createObj();
+            texture->loadRaw(_data, _size);
+            texture->createGpuBuffers();
+
+            const TextureHandle handle = this->getHandle(texture);
+
             return this->acquire(handle);
         }
 
@@ -722,34 +819,12 @@ namespace cs
 
             return this->acquire(handle);
         }
-
-        bgfx::TextureHandle load(const char* _path, uint32_t _flags, uint8_t _skip, bgfx::TextureInfo* _info)
-        {
-            TextureImpl* texture = this->createObj();
-            texture->loadBgfxOnly(_path, _flags, _skip, _info);
-
-            const TextureHandle handle = this->getHandle(texture);
-            this->acquire(handle);
-
-            return texture->m_bgfxHandle;
-        }
-
-        bgfx::TextureHandle load(const void* _data, uint32_t _size, uint32_t _flags, uint8_t _skip, bgfx::TextureInfo* _info)
-        {
-            TextureImpl* texture = this->createObj();
-            texture->loadBgfxOnly(_data, _size, _flags, _skip, _info);
-
-            const TextureHandle handle = this->getHandle(texture);
-            this->acquire(handle);
-
-            return texture->m_bgfxHandle;
-        }
     };
     static TextureResourceManager* s_textures;
 
     TextureHandle loadTextureStripes()
     {
-        const cs::TextureHandle tex = textureLoad(g_stripesS, g_stripesSSize);
+        const cs::TextureHandle tex = textureLoadRaw(g_stripesS, g_stripesSSize);
         setName(tex, "Stripes");
         return acquire(tex);
     }
@@ -762,7 +837,7 @@ namespace cs
 
     TextureHandle loadTextureBricksN()
     {
-        const cs::TextureHandle tex = textureLoad(g_bricksN, g_bricksNSize);
+        const cs::TextureHandle tex = textureLoadRaw(g_bricksN, g_bricksNSize);
         setName(tex, "Bricks normal");
         return acquire(tex);
     }
@@ -775,7 +850,7 @@ namespace cs
 
     TextureHandle loadTextureBricksAo()
     {
-        const cs::TextureHandle tex = textureLoad(g_bricksAo, g_bricksAoSize);
+        const cs::TextureHandle tex = textureLoadRaw(g_bricksAo, g_bricksAoSize);
         setName(tex, "Bricks occlusion");
         return acquire(tex);
     }
@@ -796,14 +871,9 @@ namespace cs
         return s_textures->load(_data, _size);
     }
 
-    bgfx::TextureHandle textureLoadPath(const char* _path, uint32_t _flags, uint8_t _skip, bgfx::TextureInfo* _info)
+    TextureHandle textureLoadRaw(const void* _data, uint32_t _size)
     {
-        return s_textures->load(_path, _flags, _skip, _info);
-    }
-
-    bgfx::TextureHandle textureLoadMem(const void* _data, uint32_t _size, uint32_t _flags, uint8_t _skip, bgfx::TextureInfo* _info)
-    {
-        return s_textures->load(_data, _size, _flags, _skip, _info);
+        return s_textures->loadRaw(_data, _size);
     }
 
     bgfx::TextureHandle textureGetBgfxHandle(cs::TextureHandle _handle)
@@ -866,8 +936,10 @@ namespace cs
             m_tex[Emissive]     = _emmisive;
         }
 
-        void read(bx::ReaderSeekerI* _reader, MaterialHandle _handle = MaterialHandle::invalid())
+        void read(dm::ReaderSeekerI* _reader, MaterialHandle _handle = MaterialHandle::invalid(), dm::StackAllocatorI* _stack = dm::stackAlloc)
         {
+            BX_UNUSED(_stack);
+
             uint16_t id;
             bx::read(_reader, id);
             resourceMap(id, _handle);
@@ -1006,6 +1078,31 @@ namespace cs
     {
         static const float sc_material[Material::Size] =
         {
+            0.0f, 0.0f, 0.0f, 0.0f, //albedo
+            0.0f, 0.0f, 0.0f, 0.0f, //specular
+            0.0f, 0.0f, 0.0f, 0.0f, //emissive
+            0.0f, 0.0f, 0.0f, 0.0f, //glossNormal
+            0.0f, 0.0f, 1.0f, 1.2f, //surface
+            0.0f, 0.0f, 1.0f, 0.0f, //misc
+            0.0f, 0.0f, 1.0f, 0.0f, //ao/emissiveIntensity
+            1.0f, 0.0f, 0.0f, 0.0f, //swizSurface
+            1.0f, 0.0f, 0.0f, 0.0f, //swizReflectivity
+            1.0f, 0.0f, 0.0f, 0.0f, //swizAo
+        };
+
+        return s_materials->add(sc_material);
+    }
+
+    MaterialHandle materialDefault()
+    {
+        static MaterialHandle s_material = materialCreatePlain();
+        return s_material;
+    }
+
+    MaterialHandle materialCreateShiny()
+    {
+        static const float sc_material[Material::Size] =
+        {
             1.0f, 1.0f, 1.0f, 0.0f, //albedo
             1.0f, 1.0f, 1.0f, 0.0f, //specular
             1.0f, 1.0f, 1.0f, 0.0f, //emissive
@@ -1017,12 +1114,13 @@ namespace cs
             1.0f, 0.0f, 0.0f, 0.0f, //swizReflectivity
             1.0f, 0.0f, 0.0f, 0.0f, //swizAo
         };
+
         return s_materials->add(sc_material);
     }
 
     MaterialHandle materialCreateStripes()
     {
-        const MaterialHandle mat = materialCreatePlain();
+        const MaterialHandle mat = materialCreateShiny();
         setName(mat, "Stripes");
 
         cs::Material& obj = cs::getObj(mat);
@@ -1035,7 +1133,7 @@ namespace cs
 
     MaterialHandle materialCreateBricks()
     {
-        const MaterialHandle mat = materialCreatePlain();
+        const MaterialHandle mat = materialCreateShiny();
         setName(mat, "Bricks");
 
         cs::Material& obj = cs::getObj(mat);
@@ -1065,45 +1163,18 @@ namespace cs
     // Mesh.
     //-----
 
-    struct Group
+    struct GeometryHandles
     {
-        Group()
-        {
-            reset();
-        }
-
-        void reset()
-        {
-            m_vbh.idx    = bgfx::invalidHandle;
-            m_ibh.idx    = bgfx::invalidHandle;
-            m_vertexData = NULL;
-            m_indexData  = NULL;
-            m_prims.clear();
-            m_matName[0] = '\0';
-        }
-
-        enum { MaterialNameLen = 255 };
-
         bgfx::VertexBufferHandle m_vbh;
-        bgfx::IndexBufferHandle m_ibh;
-        void* m_vertexData;
-        uint32_t m_vertexSize;
-        uint16_t m_numVertices;
-        void* m_indexData;
-        uint32_t m_indexSize;
-        uint32_t m_numIndices;
-        Sphere m_sphere;
-        Aabb m_aabb;
-        Obb m_obb;
-        PrimitiveArray m_prims;
-        char m_matName[MaterialNameLen+1];
+        bgfx::IndexBufferHandle  m_ibh;
     };
+    typedef dm::ObjArray<GeometryHandles> GeometryHandleArray;
 
-    struct MeshImpl : public Mesh, public ReadWriteI<MeshHandle>
+    struct MeshImpl : public Mesh, public Geometry, public ReadWriteI<MeshHandle>
     {
         MeshImpl()
         {
-            m_normScale = FLT_MAX;
+            m_normScale = 1.0f;
         }
 
         ~MeshImpl()
@@ -1111,135 +1182,42 @@ namespace cs
             destroy();
         }
 
-        void read(bx::ReaderSeekerI* _reader, MeshHandle _handle = MeshHandle::invalid())
+        void read(dm::ReaderSeekerI* _reader, MeshHandle _handle = MeshHandle::invalid(), dm::StackAllocatorI* _stack = dm::stackAlloc)
         {
-            #define BGFX_CHUNK_MAGIC_VB  BX_MAKEFOURCC('V', 'B', ' ', 0x1)
-            #define BGFX_CHUNK_MAGIC_IB  BX_MAKEFOURCC('I', 'B', ' ', 0x0)
-            #define BGFX_CHUNK_MAGIC_PRI BX_MAKEFOURCC('P', 'R', 'I', 0x0)
+            load(_reader, "bin", NULL, _stack, _handle);
+        }
 
-            Group group;
+        bool load(dm::ReaderSeekerI* _reader
+                , const char* _ext
+                , void* _userData = NULL
+                , dm::StackAllocatorI* _stack = dm::stackAlloc
+                , MeshHandle _handle = MeshHandle::invalid()
+                )
+        {
+            dm::push(_stack);
 
-            bool done = false;
-            uint32_t chunk;
-            while (!done && 4 == bx::read(_reader, chunk))
+            cs::OutDataHeader* header = NULL;
+            geometryLoad(*this, _reader, _ext, _stack, _userData, &header, _stack);
+
+            if (NULL != header)
             {
-                switch (chunk)
+                switch (header->m_format)
                 {
-                case BGFX_CHUNK_MAGIC_VB:
+                case cs::FileFormat::BgfxBin:
                     {
-                        bx::read(_reader, group.m_sphere);
-                        bx::read(_reader, group.m_aabb);
-                        bx::read(_reader, group.m_obb);
+                        BgfxBinOutData* meshData = (BgfxBinOutData*)header;
 
-                        bgfx::read(_reader, m_decl);
-                        const uint16_t stride = m_decl.getStride();
-
-                        bx::read(_reader, group.m_numVertices);
-
-                        group.m_vertexSize = group.m_numVertices*stride;
-                        group.m_vertexData = BX_ALLOC(g_mainAlloc, group.m_vertexSize);
-                        bx::read(_reader, group.m_vertexData, group.m_vertexSize);
+                        m_normScale = meshData->m_normScale;
+                        resourceMap(meshData->m_handle, _handle);
                     }
                 break;
-
-                case BGFX_CHUNK_MAGIC_IB:
-                    {
-                        bx::read(_reader, group.m_numIndices);
-
-                        group.m_indexSize = group.m_numIndices*2;
-                        group.m_indexData = BX_ALLOC(g_mainAlloc, group.m_indexSize);
-                        bx::read(_reader, group.m_indexData, group.m_indexSize);
-                    }
-                break;
-
-                case BGFX_CHUNK_MAGIC_PRI:
-                    {
-                        uint16_t len;
-                        bx::read(_reader, len);
-
-                        if (len < 256)
-                        {
-                            bx::read(_reader, group.m_matName, len);
-                            group.m_matName[len] = '\0';
-                        }
-                        else
-                        {
-                            StackAllocScope scope(g_stackAlloc);
-
-                            void* matName = BX_ALLOC(g_stackAlloc, len);
-
-                            bx::read(_reader, matName, len);
-
-                            memcpy(group.m_matName, matName, Group::MaterialNameLen);
-                            group.m_matName[Group::MaterialNameLen] = '\0';
-
-                            BX_FREE(g_stackAlloc, matName);
-                        }
-
-                        uint16_t num;
-                        bx::read(_reader, num);
-
-                        for (uint32_t ii = 0; ii < num; ++ii)
-                        {
-                            bx::read(_reader, len);
-
-                            if (len < 256)
-                            {
-                                char name[256];
-                                bx::read(_reader, name, len);
-                            }
-                            else
-                            {
-                                StackAllocScope scope(g_stackAlloc);
-
-                                void* matName = BX_ALLOC(g_stackAlloc, len);
-
-                                bx::read(_reader, matName, len);
-
-                                BX_FREE(g_stackAlloc, matName);
-                            }
-
-                            Primitive prim;
-                            bx::read(_reader, prim.m_startIndex);
-                            bx::read(_reader, prim.m_numIndices);
-                            bx::read(_reader, prim.m_startVertex);
-                            bx::read(_reader, prim.m_numVertices);
-                            bx::read(_reader, prim.m_sphere);
-                            bx::read(_reader, prim.m_aabb);
-                            bx::read(_reader, prim.m_obb);
-
-                            group.m_prims.push_back(prim);
-                        }
-
-                        m_groups.addObj(group);
-                        group.reset();
-                    }
-                break;
-
-                case CMFTSTUDIO_CHUNK_MAGIC_MSH_MISC:
-                    {
-                        uint16_t id;
-                        bx::read(_reader, id);
-                        resourceMap(id, _handle);
-
-                        bx::read(_reader, m_normScale);
-                    }
-                break;
-
-                case CMFTSTUDIO_CHUNK_MAGIC_MSH_DONE:
-                    {
-                        done = true;
-                    }
-                break;
-
-                default:
-                    DBG("%08x at %d", chunk, _reader->seek());
-                break;
-                }
+                };
             }
 
+            dm::pop(_stack);
+
             // Get normalized scale.
-            if (FLT_MAX == m_normScale)
+            if (1.0f == m_normScale)
             {
                 float min = FLT_MAX;
                 float max = -FLT_MAX;
@@ -1264,36 +1242,27 @@ namespace cs
 
                 m_normScale = 1.0f/(max-min);
             }
-        }
 
-        void load(const char* _filePath)
-        {
-            bx::CrtFileReader reader;
-            if (0 == reader.open(_filePath))
-            {
-                this->read(&reader);
-                reader.close();
-            }
-        }
-
-        void load(const void* _data, uint32_t _size)
-        {
-            bx::MemoryReader reader(_data, _size);
-            this->read(&reader);
+            return true;
         }
 
         void createGpuBuffers()
         {
-            for (uint32_t ii = 0, end = m_groups.count(); ii < end; ++ii)
+            const uint32_t numGroups = m_groups.count();
+            m_bufferHandles.init(numGroups, dm::mainAlloc);
+            m_bufferHandles.reserve(numGroups);
+
+            for (uint32_t ii = 0; ii < numGroups; ++ii)
             {
                 Group& group = m_groups[ii];
                 const bgfx::Memory* mem;
 
                 mem = bgfx::makeRef(group.m_vertexData, group.m_vertexSize);
-                group.m_vbh = bgfx::createVertexBuffer(mem, m_decl);
+                m_bufferHandles[ii].m_vbh = bgfx::createVertexBuffer(mem, m_decl);
 
+                const uint16_t flags = (group.m_32bitIndexBuffer ? BGFX_BUFFER_INDEX32 : 0);
                 mem = bgfx::makeRef(group.m_indexData, group.m_indexSize);
-                group.m_ibh = bgfx::createIndexBuffer(mem);
+                m_bufferHandles[ii].m_ibh = bgfx::createIndexBuffer(mem, flags);
             }
         }
 
@@ -1307,27 +1276,21 @@ namespace cs
                   )
         {
             Group& group = m_groups[_groupIdx];
-            for (PrimitiveArray::const_iterator it = group.m_prims.begin(), itEnd = group.m_prims.end(); it != itEnd; ++it)
+            for (uint16_t ii = group.m_prims.count(); ii--; )
             {
-                const Primitive& prim = *it;
+                const Primitive& prim = group.m_prims[ii];
 
                 // Material.
-                if (isValid(_material))
+                cs::MaterialHandle material = cs::isValid(_material) ? _material : cs::materialDefault();
+                cs::setMaterial(material);
+                const Material& currentMaterial = getObj(material);
+                if (currentMaterial.has(Material::Normal) && 1.0f == currentMaterial.m_normal.sample)
                 {
-                    cs::setMaterial(_material);
-
-                    const Material& currentMaterial = getObj(_material);
-                    if (currentMaterial.has(Material::Normal) && 1.0f == currentMaterial.m_normal.sample)
-                    {
-                        _prog = programNormal(_prog);
-                    }
+                    _prog = programNormal(_prog);
                 }
 
-                // Program.
-                bgfx::setProgram(getProgram(_prog));
-
                 // Environment.
-                if (isValid(_env))
+                if (cs::isValid(_env))
                 {
                     cs::setEnv(_env);
                 }
@@ -1336,14 +1299,13 @@ namespace cs
                 bgfx::setTransform(_mtx);
 
                 // Buffers.
-                bgfx::setIndexBuffer(group.m_ibh, prim.m_startIndex, prim.m_numIndices);
-                bgfx::setVertexBuffer(group.m_vbh);
+                bgfx::setIndexBuffer(m_bufferHandles[_groupIdx].m_ibh, prim.m_startIndex, prim.m_numIndices);
+                bgfx::setVertexBuffer(m_bufferHandles[_groupIdx].m_vbh);
 
                 // State.
                 bgfx::setState(_state);
 
-                submitUniforms();
-                bgfx::submit(_view);
+                bgfx_submit(_view, _prog);
             }
         }
 
@@ -1374,25 +1336,21 @@ namespace cs
                   )
         {
             Group& group = m_groups[_groupIdx];
-            for (PrimitiveArray::const_iterator it = group.m_prims.begin(), itEnd = group.m_prims.end(); it != itEnd; ++it)
+            for (uint16_t ii = group.m_prims.count(); ii--; )
             {
-                const Primitive& prim = *it;
+                const Primitive& prim = group.m_prims[ii];
 
                 // Material.
-                if (isValid(_material))
+                cs::MaterialHandle material = cs::isValid(_material) ? _material : cs::materialDefault();
+                cs::setMaterial(material);
+                const Material& currentMaterial = getObj(material);
+                if (currentMaterial.has(Material::Normal) && 1.0f == currentMaterial.m_normal.sample)
                 {
-                    cs::setMaterial(_material);
-
-                    const Material& currentMaterial = getObj(_material);
-                    if (currentMaterial.has(Material::Normal) && 1.0f == currentMaterial.m_normal.sample)
-                    {
-                        _prog = programNormal(_prog);
-                    }
+                    _prog = programNormal(_prog);
                 }
 
                 //Program.
                 _prog = programTrans(_prog); // Use transition program.
-                bgfx::setProgram(getProgram(_prog));
 
                 // Uniforms.
                 cs::Uniforms& uniforms = cs::getUniforms();
@@ -1406,14 +1364,13 @@ namespace cs
                 bgfx::setTransform(_mtx);
 
                 // Buffers.
-                bgfx::setIndexBuffer(group.m_ibh, prim.m_startIndex, prim.m_numIndices);
-                bgfx::setVertexBuffer(group.m_vbh);
+                bgfx::setIndexBuffer(m_bufferHandles[_groupIdx].m_ibh, prim.m_startIndex, prim.m_numIndices);
+                bgfx::setVertexBuffer(m_bufferHandles[_groupIdx].m_vbh);
 
                 // State.
                 bgfx::setState(_state);
 
-                submitUniforms();
-                bgfx::submit(_view);
+                bgfx_submit(_view, _prog);
             }
         }
 
@@ -1445,8 +1402,9 @@ namespace cs
                       , m_decl
                       , (const uint16_t*)group.m_indexData
                       , group.m_numIndices
-                      , group.m_matName
-                      , group.m_prims
+                      , group.m_materialName
+                      , group.m_prims.elements()
+                      , group.m_prims.count()
                       );
             }
         }
@@ -1483,13 +1441,13 @@ namespace cs
 
                 if (NULL != group.m_vertexData)
                 {
-                    BX_FREE(_delayed ? g_delayedFree : g_mainAlloc, group.m_vertexData);
+                    BX_FREE(_delayed ? cs::delayedFree : dm::mainAlloc, group.m_vertexData);
                     group.m_vertexData = NULL;
                 }
 
                 if (NULL != group.m_indexData)
                 {
-                    BX_FREE(_delayed ? g_delayedFree : g_mainAlloc, group.m_indexData);
+                    BX_FREE(_delayed ? cs::delayedFree : dm::mainAlloc, group.m_indexData);
                     group.m_indexData = NULL;
                 }
             }
@@ -1497,41 +1455,70 @@ namespace cs
 
         void destroy()
         {
-            for (uint32_t ii = m_groups.count(); ii--; )
+            if (m_groups.isInitialized())
             {
-                Group& group = m_groups[ii];
-                if (bgfx::isValid(group.m_vbh)) { bgfx::destroyVertexBuffer(group.m_vbh);   }
-                if (bgfx::isValid(group.m_ibh)) { bgfx::destroyIndexBuffer(group.m_ibh);    }
-                if (NULL != group.m_vertexData) { BX_FREE(g_mainAlloc, group.m_vertexData); }
-                if (NULL != group.m_indexData)  { BX_FREE(g_mainAlloc, group.m_indexData);  }
+                for (uint32_t ii = m_groups.count(); ii--; )
+                {
+                    if (NULL != m_groups[ii].m_vertexData)  { BX_FREE(dm::mainAlloc, m_groups[ii].m_vertexData); }
+                    if (NULL != m_groups[ii].m_indexData)   { BX_FREE(dm::mainAlloc, m_groups[ii].m_indexData);  }
+                }
+                m_groups.reset();
             }
-            m_groups.reset();
+
+            if (m_bufferHandles.isInitialized())
+            {
+                for (uint32_t ii = m_bufferHandles.count(); ii--; )
+                {
+                    if (bgfx::isValid(m_bufferHandles[ii].m_vbh)) { bgfx::destroyVertexBuffer(m_bufferHandles[ii].m_vbh); }
+                    if (bgfx::isValid(m_bufferHandles[ii].m_ibh)) { bgfx::destroyIndexBuffer(m_bufferHandles[ii].m_ibh);  }
+                }
+                m_bufferHandles.reset();
+            }
         }
 
-        bgfx::VertexDecl m_decl;
-        dm::ObjArrayT<Group, CS_MAX_MESH_GROUPS> m_groups;
+        GeometryHandleArray m_bufferHandles;
     };
 
     struct MeshResourceManager : public ResourceManagerT<Mesh, MeshImpl, MeshHandle, CS_MAX_MESHES>
     {
-        MeshHandle load(const void* _data, uint32_t _size)
+        MeshHandle load(const void* _data, uint32_t _size, const char* _ext)
         {
-            MeshImpl* mesh = this->createObj();
-            mesh->load(_data, _size);
-            mesh->createGpuBuffers();
+            dm::MemoryReader reader(_data, _size);
 
+            MeshImpl* mesh = this->createObj();
             const MeshHandle handle = this->getHandle(mesh);
+
+            const bool loaded = mesh->load(&reader, _ext);
+
+            if (!loaded)
+            {
+                return MeshHandle::invalid();
+            }
 
             return this->acquire(handle);
         }
 
-        MeshHandle load(const char* _path)
+        MeshHandle load(const char* _path, void* _userData, dm::StackAllocatorI* _stack)
         {
-            MeshImpl* mesh = this->createObj();
-            mesh->load(_path);
-            mesh->createGpuBuffers();
+            const char* ext = dm::fileExt(_path);
+            const bool isBinary = (0 == strcmp(ext, "bin"));
 
+            dm::CrtFileReader reader;
+            if (0 != reader.open(_path, isBinary))
+            {
+                return MeshHandle::invalid();
+            }
+
+            MeshImpl* mesh = this->createObj();
             const MeshHandle handle = this->getHandle(mesh);
+
+            const bool loaded = mesh->load(&reader, ext, _userData, _stack);
+            reader.close();
+
+            if (!loaded)
+            {
+                return MeshHandle::invalid();
+            }
 
             return this->acquire(handle);
         }
@@ -1540,8 +1527,9 @@ namespace cs
 
     static inline MeshHandle loadSphere()
     {
-        MeshHandle sphere = s_meshes->load(g_sphereMesh, g_sphereMeshSize);
+        MeshHandle sphere = s_meshes->load(g_sphereMesh, g_sphereMeshSize, "bin");
         setName(sphere, "Sphere");
+        createGpuBuffers(sphere);
         return sphere;
     }
 
@@ -1557,19 +1545,19 @@ namespace cs
         return mesh->m_groups.count();
     }
 
-    MeshHandle meshLoad(const void* _data, uint32_t _size)
+    MeshHandle meshLoad(const void* _data, uint32_t _size, const char* _ext)
     {
-        return s_meshes->load(_data, _size);
+        return s_meshes->load(_data, _size, _ext);
     }
 
-    MeshHandle meshLoad(const char* _filePath)
+    MeshHandle meshLoad(const char* _filePath, void* _userData, dm::StackAllocatorI* _stack)
     {
-        return s_meshes->load(_filePath);
+        return s_meshes->load(_filePath, _userData, _stack);
     }
 
-    MeshHandle meshLoad(bx::ReaderSeekerI* _reader)
+    MeshHandle meshLoad(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack)
     {
-        return s_meshes->read(_reader);
+        return s_meshes->read(_reader, _stack);
     }
 
     bool meshSave(MeshHandle _mesh, const char* _filePath)
@@ -1607,30 +1595,37 @@ namespace cs
         m_pos[1]   = 0.0f;
         m_pos[2]   = 0.0f;
         m_mesh     = MeshHandle::invalid();
-
-        for (uint16_t ii = 0; ii < CS_MAX_MESH_GROUPS; ++ii)
-        {
-            m_materials[ii] = MaterialHandle::invalid();
-        }
-        m_selectedGroup = 0;
+        m_selGroup = 0;
     }
 
     MeshInstance::MeshInstance(const MeshInstance& _other)
     {
-        memcpy(this, &_other, sizeof(MeshInstance));
+        m_scale    = _other.m_scale;
+        m_scaleAdj = _other.m_scaleAdj;
+        m_rot[0]   = _other.m_rot[0];
+        m_rot[1]   = _other.m_rot[1];
+        m_rot[2]   = _other.m_rot[2];
+        m_pos[0]   = _other.m_pos[0];
+        m_pos[1]   = _other.m_pos[1];
+        m_pos[2]   = _other.m_pos[2];
+        m_mesh     = _other.m_mesh;
+        m_selGroup = _other.m_selGroup;
 
-        if (isValid(m_mesh))
+        const uint32_t matCount = _other.m_materials.max();
+        m_materials.reinit(matCount, dm::mainAlloc);
+
+        m_materials.reserve(matCount);
+        for (uint32_t ii = matCount; ii--; )
         {
-            cs::acquire(m_mesh);
+            m_materials[ii] = _other.m_materials[ii];
         }
 
-        for (uint32_t ii = 0, count = meshNumGroups(m_mesh); ii < count; ++ii)
-        {
-            if (isValid(m_materials[ii]))
-            {
-                cs::acquire(m_materials[ii]);
-            }
-        }
+        cs::acquire(this);
+    }
+
+    MeshInstance::~MeshInstance()
+    {
+        cs::release(this);
     }
 
     void MeshInstance::set(MeshHandle _mesh)
@@ -1640,20 +1635,51 @@ namespace cs
             cs::release(m_mesh);
         }
         m_mesh = cs::acquire(_mesh);
+
+        const uint32_t groupsCount = meshNumGroups(_mesh);
+
+        if (!m_materials.isInitialized())
+        {
+            m_materials.init(groupsCount, dm::mainAlloc);
+            m_materials.fillWith(cs::MaterialHandle::invalid());
+        }
+        else
+        {
+            const uint32_t currMatCount = m_materials.max();
+            if (groupsCount < currMatCount) // Shrink.
+            {
+                m_materials.cut(groupsCount);
+            }
+            else // Expand.
+            {
+                if (groupsCount > m_materials.max())
+                {
+                    m_materials.resize(groupsCount);
+                }
+
+                for (uint16_t ii = groupsCount-currMatCount; ii--; )
+                {
+                    m_materials.add(cs::MaterialHandle::invalid());
+                }
+            }
+        }
     }
 
     void MeshInstance::set(MaterialHandle _material, uint32_t _groupIdx)
     {
-        if (isValid(m_materials[_groupIdx]))
+        if (_groupIdx < m_materials.max())
         {
-            cs::release(m_materials[_groupIdx]);
+            if (isValid(m_materials[_groupIdx]))
+            {
+                cs::release(m_materials[_groupIdx]);
+            }
+            m_materials[_groupIdx] = cs::acquire(_material);
         }
-        m_materials[_groupIdx] = cs::acquire(_material);
     }
 
     cs::MaterialHandle MeshInstance::getActiveMaterial() const
     {
-        return m_materials[m_selectedGroup];
+        return m_materials[m_selGroup];
     }
 
     float* MeshInstance::computeMtx()
@@ -1682,7 +1708,7 @@ namespace cs
             cs::acquire(_inst->m_mesh);
         }
 
-        for (uint16_t ii = 0; ii < CS_MAX_MESH_GROUPS; ++ii)
+        for (uint16_t ii = 0, end = _inst->m_materials.max(); ii < end; ++ii)
         {
             if (isValid(_inst->m_materials[ii]))
             {
@@ -1693,6 +1719,11 @@ namespace cs
         return const_cast<MeshInstance*>(_inst);
     }
 
+    MeshInstance& acquire(const MeshInstance& _inst)
+    {
+        return *acquire(&_inst);
+    }
+
     void release(const MeshInstance* _inst)
     {
         if (isValid(_inst->m_mesh))
@@ -1700,7 +1731,7 @@ namespace cs
             cs::release(_inst->m_mesh);
         }
 
-        for (uint16_t ii = 0; ii < CS_MAX_MESH_GROUPS; ++ii)
+        for (uint16_t ii = 0, end = _inst->m_materials.max(); ii < end; ++ii)
         {
             if (isValid(_inst->m_materials[ii]))
             {
@@ -1708,7 +1739,6 @@ namespace cs
             }
         }
     }
-
 
     // Environment.
     //-----
@@ -1723,6 +1753,7 @@ namespace cs
 
             m_origSkybox = TextureHandle::invalid();
 
+            memset(m_lights, 0, sizeof(m_lights));
             m_edgeFixup = cmft::EdgeFixup::None;
             m_lightsNum = 0;
             for (uint8_t ii = 0; ii < CS_MAX_LIGHTS; ++ii)
@@ -1751,16 +1782,17 @@ namespace cs
             tex->m_width    = (uint16_t)_image.m_width;
             tex->m_height   = (uint16_t)_image.m_height;
             tex->m_format   = cmftToBgfx(_image.m_format).bgfxFormat();
+            tex->m_type     = TextureImpl::Type::TexCube;
             tex->m_freeData = false;
         }
 
         void create(uint32_t _rgba = 0x303030ff, uint32_t _size = 128)
         {
-            StackAllocScope scope(g_stackAlloc);
+            dm::StackAllocScope scope(dm::stackAlloc);
 
             // Create cubemap image.
             cmft::Image cubemap;
-            cmft::imageCreate(cubemap, _size, _size, _rgba, 1, 6, cmft::TextureFormat::BGRA8, g_stackAlloc);
+            cmft::imageCreate(cubemap, _size, _size, _rgba, 1, 6, cmft::TextureFormat::BGRA8, dm::stackAlloc);
 
             // Setup cubemaps.
             cmft::imageCopy(m_cubemapImage[Environment::Skybox], cubemap);
@@ -1771,7 +1803,7 @@ namespace cs
             imageToTextureRef(m_cubemap[Environment::Iem],    m_cubemapImage[Environment::Iem]);
 
             // Cleanup.
-            cmft::imageUnload(cubemap, g_stackAlloc);
+            cmft::imageUnload(cubemap, dm::stackAlloc);
         }
 
         // Notice this takes ownership of '_image'.
@@ -1794,21 +1826,21 @@ namespace cs
             const bool isLatlong = cmft::imageIsLatLong(_image);
             const TextureFormatInfo tfi = cmftToBgfx(_image.m_format);
 
-            StackAllocScope scope(g_stackAlloc);
+            dm::StackAllocScope scope(dm::stackAlloc);
 
             cmft::ImageHardRef imageRgba32f;
-            cmft::imageRefOrConvert(imageRgba32f, cmft::TextureFormat::RGBA32F, _image, g_stackAlloc);
+            cmft::imageRefOrConvert(imageRgba32f, cmft::TextureFormat::RGBA32F, _image, dm::stackAlloc);
 
             // Cubemap image.
             // Try to go the shortest path possible.
             if (isLatlong)
             {
-                StackAllocScope scope(g_stackAlloc);
+                dm::StackAllocScope scope(dm::stackAlloc);
 
                 cmft::Image tmp;
-                cmft::imageCubemapFromLatLong(tmp, imageRgba32f, true, g_stackAlloc);
+                cmft::imageCubemapFromLatLong(tmp, imageRgba32f, true, dm::stackAlloc);
                 cmft::imageConvert(m_cubemapImage[_which], tfi.convert() ? tfi.cmftFormat() : _image.m_format, tmp);
-                cmft::imageUnload(tmp, g_stackAlloc);
+                cmft::imageUnload(tmp, dm::stackAlloc);
             }
             else if (tfi.convert())
             {
@@ -1818,12 +1850,12 @@ namespace cs
                 }
                 else
                 {
-                    StackAllocScope scope(g_stackAlloc);
+                    dm::StackAllocScope scope(dm::stackAlloc);
 
                     cmft::Image cubemap;
-                    cmft::imageToCubemap(cubemap, imageRgba32f, g_stackAlloc);
+                    cmft::imageToCubemap(cubemap, imageRgba32f, dm::stackAlloc);
                     cmft::imageConvert(m_cubemapImage[_which], tfi.cmftFormat(), cubemap);
-                    cmft::imageUnload(cubemap, g_stackAlloc);
+                    cmft::imageUnload(cubemap, dm::stackAlloc);
                 }
             }
             else //if (!tfi.convert()).
@@ -1852,7 +1884,7 @@ namespace cs
             imageToTextureRef(m_cubemap[_which], m_cubemapImage[_which]);
 
             // Cleanup.
-            cmft::imageUnload(imageRgba32f, g_stackAlloc);
+            cmft::imageUnload(imageRgba32f, dm::stackAlloc);
             cmft::imageUnload(_image);
 
             return true;
@@ -1993,10 +2025,12 @@ namespace cs
 
         void createGpuBuffers(cs::TextureHandle _cubemap)
         {
+            enum { CubeTexFlags = BGFX_TEXTURE_U_CLAMP|BGFX_TEXTURE_V_CLAMP|BGFX_TEXTURE_W_CLAMP };
+
             TextureImpl* cube = s_textures->getImpl(_cubemap);
             if (!isValid(cube->m_bgfxHandle))
             {
-                cube->createGpuBuffersCube();
+                cube->createGpuBuffers(CubeTexFlags);
             }
         }
 
@@ -2007,8 +2041,10 @@ namespace cs
             createGpuBuffers(m_cubemap[Environment::Iem]);
         }
 
-        void read(bx::ReaderSeekerI* _reader, EnvHandle _handle = EnvHandle::invalid())
+        void read(dm::ReaderSeekerI* _reader, EnvHandle _handle = EnvHandle::invalid(), dm::StackAllocatorI* _stack = dm::stackAlloc)
         {
+            BX_UNUSED(_stack);
+
             this->destroy();
 
             uint16_t id;
@@ -2035,7 +2071,7 @@ namespace cs
                 bx::read(_reader, image.m_format);
                 bx::read(_reader, image.m_numMips);
                 bx::read(_reader, image.m_numFaces);
-                image.m_data = BX_ALLOC(g_mainAlloc, image.m_dataSize);
+                image.m_data = BX_ALLOC(dm::mainAlloc, image.m_dataSize);
                 bx::read(_reader, image.m_data, image.m_dataSize);
                 this->load(Environment::Enum(ii), image);
             }
@@ -2089,7 +2125,7 @@ namespace cs
         }
     };
 
-    struct EnvironmentResourceManager : public ResourceManagerT<Environment, EnvironmentImpl, EnvHandle, CS_MAX_ENVMAPS>
+    struct EnvironmentResourceManager : public ResourceManagerT<Environment, EnvironmentImpl, EnvHandle, CS_MAX_ENVIRONMENTS>
     {
         EnvHandle create(uint32_t _rgba)
         {
@@ -2151,7 +2187,7 @@ namespace cs
         return s_environments->load(_skyboxPath, _pmremPath, _iemPath);
     }
 
-    EnvHandle envCreate(bx::ReaderSeekerI* _reader)
+    EnvHandle envCreate(dm::ReaderSeekerI* _reader)
     {
         return s_environments->read(_reader);
     }
@@ -2290,6 +2326,7 @@ namespace cs
 
     void initContext()
     {
+        // Initialize resource managers.
         enum
         {
             TexOffset = 0,
@@ -2299,13 +2336,16 @@ namespace cs
             TotalSize = EnvOffset + sizeof(EnvironmentResourceManager),
         };
 
-        m_contextMemoryBlock = BX_ALLOC(g_staticAlloc, TotalSize);
+        m_contextMemoryBlock = BX_ALLOC(dm::staticAlloc, TotalSize);
 
         uint8_t* mem = (uint8_t*)m_contextMemoryBlock;
         s_textures     = ::new (mem+TexOffset) TextureResourceManager();
         s_materials    = ::new (mem+MatOffset) MaterialResourceManager();
         s_meshes       = ::new (mem+MshOffset) MeshResourceManager();
         s_environments = ::new (mem+EnvOffset) EnvironmentResourceManager();
+
+        // Initialize loaders.
+        initGeometryLoaders();
     }
 
     void destroyContext()
@@ -2314,7 +2354,7 @@ namespace cs
         s_meshes->~MeshResourceManager();
         s_materials->~MaterialResourceManager();
         s_textures->~TextureResourceManager();
-        BX_FREE(g_staticAlloc, m_contextMemoryBlock);
+        BX_FREE(dm::staticAlloc, m_contextMemoryBlock);
     }
 
     void freeHostMem(TextureHandle _handle)
@@ -2337,17 +2377,26 @@ namespace cs
 
     void setTexture(TextureUniform::Enum _which, cs::TextureHandle _handle, uint32_t _flags)
     {
-        bgfx::setTexture(s_textureStage[_which], s_uniforms.u_tex[_which], textureGetBgfxHandle(_handle), _flags);
+        if (isValid(_handle))
+        {
+            bgfx::setTexture(s_textureStage[_which], s_uniforms.u_tex[_which], textureGetBgfxHandle(_handle), _flags);
+        }
     }
 
     void setTexture(TextureUniform::Enum _which, bgfx::TextureHandle _handle, uint32_t _flags)
     {
-        bgfx::setTexture(s_textureStage[_which], s_uniforms.u_tex[_which], _handle, _flags);
+        if (isValid(_handle))
+        {
+            bgfx::setTexture(s_textureStage[_which], s_uniforms.u_tex[_which], _handle, _flags);
+        }
     }
 
-    void setTexture(TextureUniform::Enum _which, bgfx::FrameBufferHandle _handle, uint8_t _attachment, uint32_t _flags)
+    void setTexture(TextureUniform::Enum _which, bgfx::FrameBufferHandle _handle, uint32_t _flags, uint8_t _attachment)
     {
-        bgfx::setTexture(s_textureStage[_which], s_uniforms.u_tex[_which], _handle, _attachment, _flags);
+        if (isValid(_handle))
+        {
+            bgfx::setTexture(s_textureStage[_which], s_uniforms.u_tex[_which], _handle, _attachment, _flags);
+        }
     }
 
     void setMaterial(MaterialHandle _handle)
@@ -2375,7 +2424,7 @@ namespace cs
               )
     {
         MeshImpl* mesh = s_meshes->getImpl(_instance.m_mesh);
-        mesh->submit(_view, _prog, _env, _instance.computeMtx(), _instance.m_materials, _state);
+        mesh->submit(_view, _prog, _env, _instance.computeMtx(), _instance.m_materials.elements(), _state);
     }
 
     void submit(uint8_t _view
@@ -2548,7 +2597,7 @@ namespace cs
         s_environments->release(_handle);
     }
 
-    TextureHandle readTexture(bx::ReaderSeekerI* _reader)
+    TextureHandle readTexture(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack)
     {
         // Read name.
         char name[32];
@@ -2558,13 +2607,13 @@ namespace cs
         name[len] = '\0';
 
         // Read object.
-        const TextureHandle texture = s_textures->read(_reader);
+        const TextureHandle texture = s_textures->read(_reader, _stack);
         setName(texture, name);
 
         return texture;
     }
 
-    MaterialHandle readMaterial(bx::ReaderSeekerI* _reader)
+    MaterialHandle readMaterial(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack)
     {
         // Read name.
         char name[32];
@@ -2574,13 +2623,13 @@ namespace cs
         name[len] = '\0';
 
         // Read object.
-        const MaterialHandle material = s_materials->read(_reader);
+        const MaterialHandle material = s_materials->read(_reader, _stack);
         setName(material, name);
 
         return material;
     }
 
-    MeshHandle readMesh(bx::ReaderSeekerI* _reader)
+    MeshHandle readMesh(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack)
     {
         // Read name.
         char name[32];
@@ -2590,13 +2639,13 @@ namespace cs
         name[len] = '\0';
 
         // Read object.
-        const MeshHandle mesh = s_meshes->read(_reader);
+        const MeshHandle mesh = s_meshes->read(_reader, _stack);
         setName(mesh, name);
 
         return mesh;
     }
 
-    EnvHandle readEnv(bx::ReaderSeekerI* _reader)
+    EnvHandle readEnv(dm::ReaderSeekerI* _reader, dm::StackAllocatorI* _stack)
     {
         // Read name.
         char name[32];
@@ -2606,47 +2655,39 @@ namespace cs
         name[len] = '\0';
 
         // Read object.
-        const EnvHandle env = s_environments->read(_reader);
+        const EnvHandle env = s_environments->read(_reader, _stack);
         setName(env, name);
 
         return env;
     }
 
-    void readMeshInstance(bx::ReaderSeekerI* _reader, MeshInstance* _instance)
+    void readMeshInstance(dm::ReaderSeekerI* _reader, MeshInstance* _instance)
     {
-        uint16_t id;
-
         bx::read(_reader, _instance->m_scale);
         bx::read(_reader, _instance->m_scaleAdj);
         bx::read(_reader, _instance->m_rot, 3*sizeof(float));
         bx::read(_reader, _instance->m_pos, 3*sizeof(float));
 
+        uint16_t id;
         bx::read(_reader, id);
         resourceResolve(&_instance->m_mesh, id);
 
-        for (uint16_t ii = 0; ii < CS_MAX_MESH_GROUPS; ++ii)
+        uint16_t materialCount;
+        bx::read(_reader, materialCount);
+        _instance->m_materials.reinit(materialCount, dm::mainAlloc);
+
+        _instance->m_materials.reserve(materialCount);
+        for (uint16_t ii = 0, end = materialCount; ii < end; ++ii)
         {
             bx::read(_reader, id);
             resourceResolve(&_instance->m_materials[ii], id);
         }
     }
 
-    void createGpuBuffers(TextureHandle _handle, uint32_t _flags, uint8_t _skip, bgfx::TextureInfo* _info)
+    void createGpuBuffers(TextureHandle _handle, uint32_t _flags)
     {
         TextureImpl* tex = s_textures->getImpl(_handle);
-        tex->createGpuBuffers(_flags, _skip, _info);
-    }
-
-    void createGpuBuffersTex2D(TextureHandle _handle, uint32_t _flags)
-    {
-        TextureImpl* tex = s_textures->getImpl(_handle);
-        tex->createGpuBuffersTex2D(_flags);
-    }
-
-    void createGpuBuffersCube(TextureHandle _handle, uint32_t _flags)
-    {
-        TextureImpl* tex = s_textures->getImpl(_handle);
-        tex->createGpuBuffersCube(_flags);
+        tex->createGpuBuffers(_flags);
     }
 
     void createGpuBuffers(MeshHandle _handle)
@@ -2723,14 +2764,17 @@ namespace cs
 
     void write(bx::WriterI* _writer, const MeshInstance& _inst)
     {
-        bx::write(_writer, _inst.m_scale);
-        bx::write(_writer, _inst.m_scaleAdj);
+        bx::write(_writer, (float)_inst.m_scale);
+        bx::write(_writer, (float)_inst.m_scaleAdj);
         bx::write(_writer, _inst.m_rot, 3*sizeof(float));
         bx::write(_writer, _inst.m_pos, 3*sizeof(float));
-        bx::write(_writer, _inst.m_mesh.m_idx);
-        for (uint16_t ii = 0; ii < CS_MAX_MESH_GROUPS; ++ii)
+        bx::write(_writer, (uint16_t)_inst.m_mesh.m_idx);
+
+        const uint16_t materialCount = _inst.m_materials.max();
+        bx::write(_writer, (uint16_t)materialCount);
+        for (uint16_t ii = 0, end = materialCount; ii < end; ++ii)
         {
-            bx::write(_writer, _inst.m_materials[ii].m_idx);
+            bx::write(_writer, (uint16_t)_inst.m_materials[ii].m_idx);
         }
     }
 

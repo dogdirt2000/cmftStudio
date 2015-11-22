@@ -14,18 +14,20 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <bgfx_utils.h>     // load()
-#include <bx/string.h>      // bx::snprintf
-#include <bx/os.h>          // bx::pwd
+#include <bgfx_utils.h>             // load()
+#include <bx/string.h>              // bx::snprintf
+#include <bx/os.h>                  // bx::pwd
 
-#include <dm/misc.h>        // dm::utof, dm::equals
+#include <dm/misc.h>                // dm::utof, dm::equals
 
 #include "renderpipeline.h"
-#include "staticres.h"      // gui_res.h
+#include "staticres.h"              // gui_res.h
+#include "common/utils.h"           // vecFromLatLong(), latLongFromVec()
+#include "geometry/loadermanager.h" // cs::geometryLoaderCount(), cs::geometryLoaderGetExtensions()
 
 /// Notice: Always call tinydir functions between push/pop(_stackAlloc);
-#define _TINYDIR_MALLOC(_size) BX_ALLOC(cs::g_stackAlloc, _size)
-#define _TINYDIR_FREE(_ptr)    BX_FREE(cs::g_stackAlloc, _ptr)
+#define _TINYDIR_MALLOC(_size) DM_ALLOC(dm::stackAlloc, _size)
+#define _TINYDIR_FREE(_ptr)    DM_FREE(dm::stackAlloc, _ptr)
 #include <tinydir/tinydir.h>
 
 // Constants.
@@ -37,7 +39,7 @@ enum
     ListElementHeight   = 24,
 };
 
-// Imgui helpers.
+// Imgui helper functions.
 //-----
 
 static void imguiBool(const char* _str, float& _flag, bool _enabled = true)
@@ -261,7 +263,7 @@ static bool imguiConfirmButton(const char* _btn
     return false;
 }
 
-bool imguiDirectoryLabel(const char* _directory, uint16_t _width = 42)
+bool imguiDirectoryLabel(const char* _directory, uint16_t _width = 32)
 {
     const uint16_t end = (uint16_t)strlen(_directory);
     const uint16_t pos = (uint16_t)dm::max(0, end-_width);
@@ -269,16 +271,14 @@ bool imguiDirectoryLabel(const char* _directory, uint16_t _width = 42)
     if (0 == pos)
     {
         imguiLabel(_directory);
+        imguiSeparator(4);
     }
     else
     {
-        char label[256];
+        char label[64];
         bx::snprintf(label, sizeof(label), "...%s", &_directory[pos]);
 
-        if (imguiButton(label, true, ImguiAlign::CenterIndented))
-        {
-            return true;
-        }
+        return imguiButton(label, true, ImguiAlign::CenterIndented);
     }
 
     return false;
@@ -345,13 +345,24 @@ void guiInit()
     #include "gui_res.h"
 
     // Init imgui.
-    s_res.m_fonts[Fonts::Default] = imguiCreate(fontData, fontDataSize, fontSize);
+    s_res.m_fonts[Fonts::Default] = imguiCreate(fontData, fontDataSize, fontSize, dm::mainAlloc);
 
     // Init fonts.
     initFonts();
 
     // Init textures.
-    s_res.m_texSunIcon = cs::textureLoadMem(sunIconData, sunIconDataSize, BGFX_TEXTURE_U_CLAMP|BGFX_TEXTURE_V_CLAMP);
+    const bgfx::Memory* mem = bgfx::makeRef(sunIconData, sunIconDataSize);
+    s_res.m_texSunIcon = bgfx::createTexture(mem, BGFX_TEXTURE_U_CLAMP|BGFX_TEXTURE_V_CLAMP);
+}
+
+void guiDrawOverlay()
+{
+    screenQuad(0, 0, g_guiWidth, g_guiHeight);
+    bgfx::setState(BGFX_STATE_RGB_WRITE
+                  |BGFX_STATE_ALPHA_WRITE
+                  |BGFX_STATE_BLEND_ALPHA
+                  );
+    bgfx_submit(RenderPipeline::ViewIdGui, cs::Program::Overlay);
 }
 
 void guiDestroy()
@@ -366,10 +377,18 @@ void imguiTextureBrowserWidget(int32_t _x
                              , int32_t _y
                              , int32_t _width
                              , TextureBrowserWidgetState& _state
+                             , bool _enabled
                              )
 {
+    enum
+    {
+        ListVisibleElements = 6,
+        ListElementHeight   = 24,
+        ListHeight = ListVisibleElements*ListElementHeight,
+    };
+
     const int32_t browserHeight = 400;
-    const int32_t height = browserHeight + 357;
+    const int32_t height = 293 + ListHeight + browserHeight;
 
     _state.m_events = GuiEvent::None;
 
@@ -390,9 +409,37 @@ void imguiTextureBrowserWidget(int32_t _x
     imguiLabelBorder("Filter:");
     imguiIndent();
     {
-        imguiBool("*.dds", _state.m_extDds);
-        imguiBool("*.ktx", _state.m_extKtx);
-        imguiBool("*.pvr", _state.m_extPvr);
+        imguiBeginScroll(ListHeight, &_state.m_scroll, _enabled);
+        {
+            const uint8_t selection = imguiTabs(UINT8_MAX, true, ImguiAlign::LeftIndented, 21, 4, 2, "Select all", "Select none");
+            if (0 == selection)
+            {
+                for (uint8_t ii = 0; ii < TextureExt::Count; ++ii)
+                {
+                    _state.m_extFlag[ii] = true;
+                }
+            }
+            else if (1 == selection)
+            {
+                for (uint8_t ii = 0; ii < TextureExt::Count; ++ii)
+                {
+                    _state.m_extFlag[ii] = false;
+                }
+            }
+
+            char extLabel[FileExtensionLength+2];
+            for (uint8_t ii = 0; ii < TextureExt::Count; ++ii)
+            {
+                extLabel[0] = '*';
+                extLabel[1] = '.';
+                strcpy(&extLabel[2], getTextureExtensionStr(ii));
+
+                imguiBool(extLabel, _state.m_extFlag[ii]);
+            }
+
+            imguiSeparator(2);
+        }
+        imguiEndScroll();
     }
     imguiSeparator();
     imguiUnindent();
@@ -401,10 +448,14 @@ void imguiTextureBrowserWidget(int32_t _x
     imguiIndent();
     {
         uint8_t count = 0;
-        char extensions[3][FileExtensionLength];
-        if (_state.m_extDds) { strcpy(extensions[count++], "dds"); }
-        if (_state.m_extKtx) { strcpy(extensions[count++], "ktx"); }
-        if (_state.m_extPvr) { strcpy(extensions[count++], "pvr"); }
+        char extensions[TextureExt::Count][FileExtensionLength];
+        for (uint8_t ii = 0; ii < TextureExt::Count; ++ii)
+        {
+            if (_state.m_extFlag[ii])
+            {
+                strcpy(extensions[count++], getTextureExtensionStr(ii));
+            }
+        }
         imguiBrowser(browserHeight, _state, extensions, count);
     }
     imguiUnindent();
@@ -519,10 +570,14 @@ void imguiMeshBrowserWidget(int32_t _x
                           , MeshBrowserState& _state
                           )
 {
-    const int32_t browserHeight = 300;
-    const int32_t height = browserHeight + 497;
-
     _state.m_events = GuiEvent::None;
+
+    const char* loaderExt[CS_MAX_GEOMETRY_LOADERS];
+    cs::geometryLoaderGetExtensions(loaderExt);
+    const uint8_t loaderCount = cs::geometryLoaderCount();
+
+    const int32_t browserHeight = 300;
+    const int32_t height = browserHeight + 449 + loaderCount*24;
 
     imguiBeginArea("Load mesh", _x, _y, _width, height, true);
     imguiSeparator(7);
@@ -541,19 +596,31 @@ void imguiMeshBrowserWidget(int32_t _x
     imguiLabelBorder("Filter:");
     imguiIndent();
     {
-        imguiBool("*.bin", _state.m_extBin);
-        imguiBool("*.obj", _state.m_extObj);
+        char extLabel[FileExtensionLength+2];
+        for (uint8_t ii = 0; ii < loaderCount; ++ii)
+        {
+            extLabel[0] = '*';
+            extLabel[1] = '.';
+            dm::strscpy(&extLabel[2], loaderExt[ii], FileExtensionLength);
+
+            imguiBool(extLabel, _state.m_extFlag[ii]);
+        }
     }
-    imguiSeparator();
+    imguiSeparator(8);
     imguiUnindent();
 
     imguiLabelBorder("Browse:");
     imguiIndent();
     {
         uint8_t count = 0;
-        char extensions[2][FileExtensionLength];
-        if (_state.m_extBin) { strcpy(extensions[count++], "bin"); }
-        if (_state.m_extObj) { strcpy(extensions[count++], "obj"); }
+        char extensions[CS_MAX_GEOMETRY_LOADERS][FileExtensionLength];
+        for (uint8_t ii = 0; ii < loaderCount; ++ii)
+        {
+            if (_state.m_extFlag[ii])
+            {
+                dm::strscpy(extensions[count++], loaderExt[ii], FileExtensionLength);
+            }
+        }
         imguiBrowser(browserHeight, _state, extensions, count);
     }
     imguiUnindent();
@@ -578,8 +645,7 @@ void imguiMeshBrowserWidget(int32_t _x
     imguiLabelBorder("Action:");
     imguiIndent();
     {
-        const bool obj = (0 == strcmp(_state.m_fileExt, "obj"));
-        if (imguiButton(obj?"Convert":"Load", true, ImguiAlign::CenterIndented))
+        if (imguiButton("Load", loaderCount>0, ImguiAlign::CenterIndented))
         {
             _state.m_events = GuiEvent::HandleAction | GuiEvent::DismissWindow;
         }
@@ -604,7 +670,7 @@ void imguiEnvMapWidget(cs::EnvHandle _env
                      , bool _enabled
                      )
 {
-    const int32_t height = 931;
+    const int32_t height = 934;
     const cs::Environment& env = cs::getObj(_env);
 
     _state.m_events = GuiEvent::None;
@@ -899,11 +965,12 @@ void imguiCmftSaveWidget(int32_t _x
 {
     enum
     {
-        HeightFileType   =   96,
-        HeightOutputType =  148,
-        HeightFormat     =  120,
-        HeightBrowser    =  160,
-        Height           = 1010,
+        HeightFileType   =  96,
+        HeightOutputType = 173,
+        HeightFormat     = 192,
+        HeightBrowser    = 517,
+        HeightBrowserTab = 672,
+        Height           = 773,
     };
 
     _state.m_events = GuiEvent::None;
@@ -913,16 +980,18 @@ void imguiCmftSaveWidget(int32_t _x
                , "%s.%s", _state.m_outputName, s_extensions[_state.m_selectedFileType]);
 
     const char* areaTitle = getCubemapTypeStr(_state.m_envType);
-    imguiBeginArea(areaTitle, _x, _y, _width, Height, _enabled);
+    imguiBeginArea(areaTitle, _x, _y, _width, HeightBrowserTab, _enabled);
     imguiSeparator(4);
 
     imguiLabelBorder("Directory:");
     imguiIndent();
     {
+        imguiSeparator(2);
         if (imguiDirectoryLabel(_state.m_directory))
         {
             _state.m_events = GuiEvent::GuiUpdate;
         }
+        imguiSeparator(2);
     }
     imguiSeparator();
     imguiUnindent();
@@ -930,6 +999,7 @@ void imguiCmftSaveWidget(int32_t _x
     imguiLabelBorder("Change directory:");
     imguiIndent();
     {
+        imguiSeparator(4);
         const bool fileClicked = imguiBrowser(HeightBrowser, _state, s_extensions, 4, _state.m_outputNameExt);
         if (fileClicked)
         {
@@ -943,15 +1013,13 @@ void imguiCmftSaveWidget(int32_t _x
             }
         }
     }
-    imguiUnindent();
-
-    imguiLabelBorder("Output file:");
-    imguiIndent();
-    {
-        imguiLabel(_state.m_outputNameExt);
-    }
     imguiSeparator();
     imguiUnindent();
+
+    imguiEndArea();
+
+    imguiBeginArea(areaTitle, _x+_width, _y, _width, Height, _enabled);
+    imguiSeparator(4);
 
     imguiLabelBorder("Name:");
     imguiIndent();
@@ -1449,7 +1517,7 @@ void imguiTonemapWidget(cs::EnvHandle _env
                       , bool _enabled
                       )
 {
-    const int32_t height = 647;
+    const int32_t height = 648;
     const uint8_t latlongPreviewHeight = 120;
     const cs::Environment& env = cs::getObj(_env);
 
@@ -1566,7 +1634,7 @@ void imguiTonemapWidget(cs::EnvHandle _env
     if (imguiButton((TonemapWidgetState::Original == _state.m_selection)?"Restore":"Apply", true, ImguiAlign::CenterIndented))
     {
         _state.m_env = _env;
-        _state.m_events = GuiEvent::HandleAction;
+        _state.m_events = GuiEvent::HandleAction | GuiEvent::DismissWindow;
     }
 
     if (imguiButton("Close", true, ImguiAlign::CenterIndented))
@@ -1588,7 +1656,7 @@ void imguiEnvMapBrowserWidget(const char* _name
                             )
 {
     const int32_t browserHeight = 400;
-    const int32_t height = browserHeight + 447;
+    const int32_t height = browserHeight + 457;
 
     _state.m_events = GuiEvent::None;
 
@@ -1747,7 +1815,7 @@ void imguiModalOutputWindow(int32_t _x, int32_t _y, OutputWindowState& _state)
 {
     _state.m_events = GuiEvent::None;
 
-    drawOverlay(g_width, g_height);
+    guiDrawOverlay();
     imguiBeginArea("Output", _x, _y, OutputWindowState::Width, OutputWindowState::Height, true);
 
     imguiSeparator(8);
@@ -1789,7 +1857,7 @@ void imguiModalAboutWindow(int32_t _x
 {
     _state.m_events = GuiEvent::None;
 
-    drawOverlay(g_width, g_height);
+    guiDrawOverlay();
     imguiBeginArea("About", _x, _y, _width, _height, true);
 
     imguiSeparator(8);
@@ -1827,20 +1895,23 @@ void imguiModalMagnifyWindow(int32_t _x, int32_t _y, MagnifyWindowState& _state)
     const bgfx::TextureHandle texture = cs::textureGetBgfxHandle(env.m_cubemap[_state.m_envType]);
     const bool hasLod = (image.m_numMips!=1);
 
-    drawOverlay(g_width, g_height);
+    guiDrawOverlay();
 
     const float wPadding = 0.06f;
     const float hPadding = 0.07f;
     const float wScale = (1.0f-wPadding*2.0f);
     const float hScale = (1.0f-hPadding*2.0f);
 
-    const uint32_t width  = uint32_t(g_widthf *wScale);
-    const uint32_t height = uint32_t(g_heightf*hScale);
+    const uint32_t width  = dm::ftou(float(g_guiWidth)*wScale);
+    const uint32_t height = dm::ftou(float(g_guiHeight)*hScale);
     const int32_t heightAdj = (hasLod ? 0 : -21);
     imguiBeginArea(NULL, _x, _y, width, height + heightAdj);
     {
         imguiSeparator();
         imguiIndent(12);
+
+        const int32_t indent = DM_MAX(0, (int32_t(width)-1650)/2);
+        imguiIndent(indent);
 
         if (imguiCube(texture, _state.m_lod, (ImguiCubemap::Enum)_state.m_imguiCubemap, true, ImguiAlign::CenterIndented))
         {
@@ -1888,86 +1959,123 @@ bool imguiBrowser(int32_t _height
 
     const char* selectFile = _selectFile ? _selectFile : _state.m_fileNameExt;
 
-    cs::StackAllocScope scope(cs::g_stackAlloc);
+    dm::StackAllocScope scope(dm::stackAlloc);
 
     tinydir_dir dir;
     tinydir_open_sorted(&dir, _state.m_directory);
 
-    imguiBeginScroll(_height, &_state.m_scroll);
-
-    imguiSeparatorLine(1);
+    imguiSeparatorLine(1, ImguiAlign::CenterIndented);
     imguiSeparator(2);
-    const uint8_t button = imguiTabs(UINT8_MAX, true, ImguiAlign::LeftIndented, 21, 0, 4, "Root", "Home", "Desktop", "Runtime");
-    imguiSeparatorLine(1);
+    const uint8_t button = imguiTabs(UINT8_MAX, true, ImguiAlign::CenterIndented, 21, 0, 4, "Root", "Home", "Desktop", "Runtime");
+    imguiSeparatorLine(1, ImguiAlign::CenterIndented);
     imguiSeparator(4);
 
-    for (size_t ii = 0, end = dir.n_files; ii < end; ii++)
+    enum { BookmarkButtonsHeight = 29 };
+    imguiBeginScroll(_height-BookmarkButtonsHeight, &_state.m_scroll);
+
+    const bool windowsRootDir = _state.m_directory[1] == ':'
+                             && _state.m_directory[2] == '\0'
+                              ;
+
+    if (windowsRootDir)
     {
-        tinydir_file file;
-        if (-1 == tinydir_readfile_n(&dir, &file, ii))
+        if (imguiButton(".."))
         {
-            continue;
+            _state.m_windowsDrives = true;
         }
+    }
 
-        const bool dot      = ('.' == file.name[0]);
-        const bool dotEnd   = dot && ('\0' == file.name[1]); // never show
-        const bool dotDot   = dot && ( '.' == file.name[1]); // always show
-        const bool isHidden = dot && ('\0' != file.name[1]);
-
-        if (file.is_dir && !dotEnd && (dotDot || !isHidden || _showHidden))
+    if (_state.m_windowsDrives)
+    {
+        const uint32_t drives = dm::windowsDrives();
+        for (uint32_t ii = 0; ii < 32; ++ii)
         {
-            if (imguiButton(file.name))
+            if (0 != (drives&(1<<ii)))
             {
-                modifyDir = true;
-                dirNum = ii;
-            }
-        }
-        else if (!_showDirsOnly)
-        {
-            bool show;
-            if (NULL == _ext
-            ||  0    == _extCount)
-            {
-                show = !isHidden;
-            }
-            else
-            {
-                show = false;
-                for(uint8_t jj = 0; jj < _extCount; ++jj)
+                const char driveLetter = 'A'+ii;
+                const char buttonStr[4] = { driveLetter, ':', '\\', '\0' };
+                if (imguiButton(buttonStr))
                 {
-                    if (('.' != file.name[0])
-                    &&  (0 == bx::stricmp(_ext[jj], file.extension)))
-                    {
-                        show = true;
-                        break;
-                    }
+                    _state.m_directory[0] = buttonStr[0];
+                    _state.m_directory[1] = buttonStr[1];
+                    _state.m_directory[2] = buttonStr[2];
+                    _state.m_directory[3] = buttonStr[3];
+                    _state.m_windowsDrives = false;
                 }
             }
-
-            if (show)
+        }
+    }
+    else
+    {
+        for (size_t ii = 0, end = dir.n_files; ii < end; ii++)
+        {
+            tinydir_file file;
+            if (-1 == tinydir_readfile_n(&dir, &file, ii))
             {
-                const bool checked = selectFile ? (0 == bx::stricmp(file.name, selectFile)) : false;
-                const bool click = imguiCheck(file.name, checked);
-                if (click || checked)
-                {
-                    result = click;
-                    selectFile = NULL;
+                continue;
+            }
 
-                    dm::strscpya(_state.m_filePath, file.path);
-                    dm::strscpya(_state.m_fileName, file.name);
-                    //Remove extension.
-                    const bool hasExt = ('\0' != file.extension[0]);
-                    if (hasExt)
+            const bool dot      = ('.' == file.name[0]);
+            const bool dotEnd   = dot && ('\0' == file.name[1]); // never show
+            const bool dotDot   = dot && ( '.' == file.name[1]); // always show
+            const bool isHidden = dot && ('\0' != file.name[1]);
+
+            if (file.is_dir && !dotEnd && (dotDot || !isHidden || _showHidden))
+            {
+                if (imguiButton(file.name))
+                {
+                    modifyDir = true;
+                    dirNum = ii;
+                }
+            }
+            else if (!_showDirsOnly)
+            {
+                bool show;
+                if (NULL == _ext
+                ||  0    == _extCount)
+                {
+                    show = !isHidden;
+                }
+                else
+                {
+                    show = false;
+                    for(uint8_t jj = 0; jj < _extCount; ++jj)
                     {
-                        _state.m_fileName[file.extension-file.name-1] = '\0';
+                        if (('.' != file.name[0])
+                        &&  (0 == bx::stricmp(_ext[jj], file.extension)))
+                        {
+                            show = true;
+                            break;
+                        }
                     }
-                    dm::strscpya(_state.m_fileNameExt, file.name);
-                    dm::strscpya(_state.m_fileExt, file.extension);
+                }
+
+                if (show)
+                {
+                    const bool checked = selectFile ? (0 == bx::stricmp(file.name, selectFile)) : false;
+                    const bool click = imguiCheck(file.name, checked);
+                    if (click || checked)
+                    {
+                        result = click;
+                        selectFile = NULL;
+
+                        dm::realpath(_state.m_filePath, file.path);
+                        dm::strscpya(_state.m_fileName, file.name);
+                        //Remove extension.
+                        const bool hasExt = ('\0' != file.extension[0]);
+                        if (hasExt)
+                        {
+                            _state.m_fileName[file.extension-file.name-1] = '\0';
+                        }
+                        dm::strscpya(_state.m_fileNameExt, file.name);
+                        dm::strscpya(_state.m_fileExt, file.extension);
+                    }
                 }
             }
         }
     }
 
+    imguiSeparator(4);
     imguiEndScroll();
     imguiSeparator(4);
 
@@ -1984,7 +2092,11 @@ bool imguiBrowser(int32_t _height
 
         if (0 == button) // root
         {
-            dm::rootDir(_state.m_directory);
+            #if BX_PLATFORM_WINDOWS
+                _state.m_directory[3] = '\0';
+            #else
+                dm::rootDir(_state.m_directory);
+            #endif // BX_PLATFORM_WINDOWS
         }
         else if (1 == button) // home
         {
@@ -1999,6 +2111,8 @@ bool imguiBrowser(int32_t _height
             bx::pwd(_state.m_directory, DM_PATH_LEN);
         }
     }
+
+    dm::trimDirPath(_state.m_directory);
 
     tinydir_close(&dir);
 
@@ -2026,7 +2140,7 @@ void imguiBrowser(int32_t _height
         handles[numHandles++] = _state.m_files.getHandleAt(ii);
     }
 
-    cs::StackAllocScope scope(cs::g_stackAlloc);
+    dm::StackAllocScope scope(dm::stackAlloc);
 
     tinydir_dir dir;
     tinydir_open_sorted(&dir, _state.m_directory);
@@ -2039,88 +2153,123 @@ void imguiBrowser(int32_t _height
     imguiSeparatorLine(1);
     imguiSeparator(4);
 
-    for (size_t ii = 0, end = dir.n_files; ii < end; ii++)
+    const bool windowsRootDir = _state.m_directory[1] == ':'
+                             && _state.m_directory[2] == '\0'
+                              ;
+
+    if (windowsRootDir)
     {
-        tinydir_file file;
-        if (-1 == tinydir_readfile_n(&dir, &file, ii))
+        if (imguiButton(".."))
         {
-            continue;
+            _state.m_windowsDrives = true;
         }
+    }
 
-        const bool dot      = ('.' == file.name[0]);
-        const bool dotEnd   = dot && ('\0' == file.name[1]); // never show
-        const bool dotDot   = dot && ( '.' == file.name[1]); // always show
-        const bool isHidden = dot && ('\0' != file.name[1]);
-
-        if (file.is_dir && !dotEnd && (dotDot || !isHidden || _showHidden))
+    if (_state.m_windowsDrives)
+    {
+        const uint32_t drives = dm::windowsDrives();
+        for (uint32_t ii = 0; ii < 32; ++ii)
         {
-            if (imguiButton(file.name))
+            if (0 != (drives&(1<<ii)))
             {
-                modifyDir = true;
-                dirNum = ii;
-            }
-        }
-        else if (!_showDirsOnly)
-        {
-            bool show;
-            if (NULL == _ext
-            ||  0    == _extCount)
-            {
-                show = !isHidden;
-            }
-            else
-            {
-                show = false;
-                for(uint8_t jj = 0; jj < _extCount; ++jj)
+                const char driveLetter = 'A'+ii;
+                const char buttonStr[4] = { driveLetter, ':', '\\', '\0' };
+                if (imguiButton(buttonStr))
                 {
-                    if (0 == bx::stricmp(_ext[jj], file.extension))
-                    {
-                        show = true;
-                        break;
-                    }
+                    _state.m_directory[0] = buttonStr[0];
+                    _state.m_directory[1] = buttonStr[1];
+                    _state.m_directory[2] = buttonStr[2];
+                    _state.m_directory[3] = buttonStr[3];
+                    _state.m_windowsDrives = false;
                 }
             }
-
-            if (show)
+        }
+    }
+    else
+    {
+        for (size_t ii = 0, end = dir.n_files; ii < end; ii++)
+        {
+            tinydir_file file;
+            if (-1 == tinydir_readfile_n(&dir, &file, ii))
             {
-                bool checked = false;
-                uint16_t selected = UINT16_MAX;
-                for (uint16_t ii = numHandles; ii--; )
+                continue;
+            }
+
+            const bool dot      = ('.' == file.name[0]);
+            const bool dotEnd   = dot && ('\0' == file.name[1]); // never show
+            const bool dotDot   = dot && ( '.' == file.name[1]); // always show
+            const bool isHidden = dot && ('\0' != file.name[1]);
+
+            if (file.is_dir && !dotEnd && (dotDot || !isHidden || _showHidden))
+            {
+                if (imguiButton(file.name))
                 {
-                    const char* selectFile = _state.m_files.getObjFromHandle(handles[ii])->m_nameExt;
-                    if (0 == strcmp(file.name, selectFile))
-                    {
-                        selected = handles[ii];
-                        handles[ii] = handles[--numHandles];
-                        checked = true;
-                        break;
-                    }
+                    modifyDir = true;
+                    dirNum = ii;
                 }
-
-                const bool clicked = imguiCheck(file.name, checked);
-
-                if (clicked)
+            }
+            else if (!_showDirsOnly && _extCount > 0)
+            {
+                bool show;
+                if (NULL == _ext
+                ||  0    == _extCount)
                 {
-                    // Deselect.
-                    if (checked && UINT16_MAX != selected)
+                    show = !isHidden;
+                }
+                else
+                {
+                    show = false;
+                    for(uint8_t jj = 0; jj < _extCount; ++jj)
                     {
-                        handles[numHandles++] = selected;
-                    }
-                    // Select.
-                    else if (_state.m_files.count() < MaxSelectedT)
-                    {
-                        BrowserStateFile* newFile = _state.m_files.addNew();
-
-                        dm::strscpya(newFile->m_path, file.path);
-                        dm::strscpya(newFile->m_name, file.name);
-                        //Remove extension.
-                        const bool hasExt = ('\0' != file.extension[0]);
-                        if (hasExt)
+                        if (0 == bx::stricmp(_ext[jj], file.extension))
                         {
-                            newFile->m_name[file.extension-file.name-1] = '\0';
+                            show = true;
+                            break;
                         }
-                        dm::strscpya(newFile->m_nameExt, file.name);
-                        dm::strscpya(newFile->m_ext, file.extension);
+                    }
+                }
+
+                if (show)
+                {
+                    bool checked = false;
+                    uint16_t selected = UINT16_MAX;
+                    for (uint16_t ii = numHandles; ii--; )
+                    {
+                        const char* selectFile = _state.m_files.get(handles[ii])->m_nameExt;
+                        if (0 == strcmp(file.name, selectFile))
+                        {
+                            selected = handles[ii];
+                            handles[ii] = handles[--numHandles];
+                            checked = true;
+                            break;
+                        }
+                    }
+
+                    const bool clicked = imguiCheck(file.name, checked);
+
+                    if (clicked)
+                    {
+                        // Deselect.
+                        if (checked && UINT16_MAX != selected)
+                        {
+                            handles[numHandles++] = selected;
+                        }
+                        // Select.
+                        else if (_state.m_files.count() < MaxSelectedT)
+                        {
+                            BrowserStateFile* newFile = _state.m_files.addNew();
+
+                            dm::strscpya(newFile->m_path, file.path);
+                            dm::strscpya(newFile->m_name, file.name);
+                            //Remove extension.
+                            const bool hasExt = ('\0' != file.extension[0]);
+                            if (hasExt)
+                            {
+                                newFile->m_name[file.extension-file.name-1] = '\0';
+                            }
+                            dm::strscpya(newFile->m_nameExt, file.name);
+                            dm::strscpya(newFile->m_ext, file.extension);
+                        }
                     }
                 }
             }
@@ -2140,17 +2289,21 @@ void imguiBrowser(int32_t _height
         tinydir_open_subdir_n(&dir, dirNum);
 
         _state.m_scroll = 0;
-        _state.m_files.removeAll();
+        _state.m_files.reset();
         dm::realpath(_state.m_directory, dir.path);
     }
     else if (UINT8_MAX != button)
     {
         _state.m_scroll = 0;
-        _state.m_files.removeAll();
+        _state.m_files.reset();
 
         if (0 == button) // root
         {
-            dm::rootDir(_state.m_directory);
+            #if BX_PLATFORM_WINDOWS
+                _state.m_directory[3] = '\0';
+            #else
+                dm::rootDir(_state.m_directory);
+            #endif // BX_PLATFORM_WINDOWS
         }
         else if (1 == button) // home
         {
@@ -2166,6 +2319,8 @@ void imguiBrowser(int32_t _height
         }
     }
 
+    dm::trimDirPath(_state.m_directory);
+
     tinydir_close(&dir);
 }
 
@@ -2178,11 +2333,11 @@ void imguiModalProjectWindow(int32_t _x
                            )
 {
     const int32_t width = 350;
-    const int32_t height = 800 + int32_t(_state.m_confirmButton)*24;
+    const int32_t height = 808 + int32_t(_state.m_confirmButton)*24;
 
     _state.m_events = GuiEvent::None;
 
-    drawOverlay(g_width, g_height);
+    guiDrawOverlay();
 
     imguiBeginArea("cmftStudio project", _x, _y, width, height, true);
     imguiSeparator(7);
@@ -2341,12 +2496,11 @@ bool imguiEnvPreview(uint32_t _screenX
 
     for (uint8_t ii = 0; ii < 3; ++ii)
     {
-        cs::setProgram(cs::Program::Latlong);
         cs::setTexture(cs::TextureUniform::Skybox, env.m_cubemap[ii]);
         screenQuad(pos[ii*2], pos[ii*2+1], llWidth, llHeight);
         imguiSetCurrentScissor();
         bgfx::setState(BGFX_STATE_RGB_WRITE|BGFX_STATE_ALPHA_WRITE);
-        cs::bgfx_submit(_viewId);
+        cs::bgfx_submit(_viewId, cs::Program::Latlong);
     }
 
     const bool click = _enabled
@@ -2383,12 +2537,11 @@ void imguiLatlongWidget(int32_t _screenX
     cs::Environment& env = cs::getObj(_env);
 
     // Draw latlong image.
-    cs::setProgram(cs::Program::Latlong);
     cs::setTexture(cs::TextureUniform::Skybox, env.m_cubemap[cs::Environment::Skybox]);
     screenQuad(_screenX, _screenY, llWidth, llHeight);
     imguiSetCurrentScissor();
     bgfx::setState(BGFX_STATE_RGB_WRITE|BGFX_STATE_ALPHA_WRITE);
-    cs::bgfx_submit(_viewId);
+    cs::bgfx_submit(_viewId, cs::Program::Latlong);
 
     const bool insideLatlong = _enabled && dm::inside(_click.m_curr.m_mx, _click.m_curr.m_my, _screenX, _screenY, llWidth, llHeight);
     uint8_t mouseOverLight = UINT8_MAX;
@@ -2407,7 +2560,7 @@ void imguiLatlongWidget(int32_t _screenX
 
     for (uint8_t ii = 0; ii < CS_MAX_LIGHTS; ++ii)
     {
-        if (dm::set(env.m_lights[ii].m_enabled))
+        if (dm::isSet(env.m_lights[ii].m_enabled))
         {
             float luv[2];
             latLongFromVec(luv, env.m_lights[ii].m_dir);
@@ -2435,7 +2588,6 @@ void imguiLatlongWidget(int32_t _screenX
             uniforms.m_selectedLight = float(ii == _selectedLight);
 
             // Draw sun icon.
-            cs::setProgram(cs::Program::SunIcon);
             cs::setTexture(cs::TextureUniform::Color, s_res.m_texSunIcon);
             screenQuad(_screenX + lx - (QuadSize/2)
                      , _screenY + ly - (QuadSize/2)
@@ -2446,7 +2598,7 @@ void imguiLatlongWidget(int32_t _screenX
                           |BGFX_STATE_ALPHA_WRITE
                           |BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA)
                           );
-            cs::bgfx_submit(_viewId);
+            cs::bgfx_submit(_viewId, cs::Program::SunIcon);
         }
     }
 
@@ -2462,7 +2614,7 @@ void imguiLatlongWidget(int32_t _screenX
         }
         else if (Mouse::Hold == _click.m_left)
         {
-            if (s_active && UINT8_MAX != _selectedLight && dm::set(env.m_lights[_selectedLight].m_enabled))
+            if (s_active && UINT8_MAX != _selectedLight && dm::isSet(env.m_lights[_selectedLight].m_enabled))
             {
                 // Update direction.
                 vecFromLatLong(env.m_lights[_selectedLight].m_dir, uu, vv);
@@ -2477,7 +2629,7 @@ void imguiLatlongWidget(int32_t _screenX
                 // Iterate to find a disabled light.
                 for (uint8_t ii = 0; ii < CS_MAX_LIGHTS; ++ii)
                 {
-                    if (false == dm::set(env.m_lights[ii].m_enabled))
+                    if (false == dm::isSet(env.m_lights[ii].m_enabled))
                     {
                         // Determine direction.
                         float dir[3];
@@ -2600,7 +2752,7 @@ void imguiLeftScrollArea(int32_t _x
                 imguiRegion("Preview", NULL, _guiState.m_showMeshPreview);
                 if (_guiState.m_showMeshPreview)
                 {
-                    updateWireframePreview(instance.m_mesh, instance.m_selectedGroup);
+                    updateWireframePreview(instance.m_mesh, instance.m_selGroup);
                     imguiImage(getWireframeTexture(), 0.0f, 0.5f, 1.0f, ImguiAlign::CenterIndented, true, g_originBottomLeft);
                 }
 
@@ -2651,7 +2803,7 @@ void imguiLeftScrollArea(int32_t _x
                             for (uint16_t ii = 0, end = (uint16_t)cs::meshNumGroups(selectedMesh); ii < end; ++ii)
                             {
                                 bx::snprintf(groupName, sizeof(groupName), "Group - %u", ii);
-                                imguiCheckSelection(groupName, instance.m_selectedGroup, ii);
+                                imguiCheckSelection(groupName, instance.m_selGroup, ii);
                             }
                         }
                         imguiUnindent();
@@ -2738,7 +2890,7 @@ void imguiLeftScrollArea(int32_t _x
                     if (selectedMaterial != matHandle.m_idx)
                     {
                         const cs::MaterialHandle handle = { selectedMaterial };
-                        instance.set(handle, instance.m_selectedGroup);
+                        instance.set(handle, instance.m_selGroup);
                     }
 
                     if (imguiButton("Create new"))

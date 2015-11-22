@@ -6,7 +6,6 @@
 #include "common/common.h"
 #include "guimanager.h"
 
-#include "renderpipeline.h" // drawOverlay()
 #include "common/utils.h"   // WidgetAnimator
 
 #include <bx/string.h>      // bx::snprintf
@@ -52,7 +51,7 @@ struct StatusManager
 
             if (!m_animators[handle].m_visible)
             {
-                m_messageList.remove(idx);
+                m_messageList.removeAt(idx);
                 last--;
             }
             else
@@ -117,7 +116,7 @@ struct StatusManager
         {
             for (uint16_t ii = m_messageList.count(); ii--; )
             {
-                const Message* msg = m_messageList.get(ii);
+                const Message* msg = m_messageList.getAt(ii);
                 if (msg->m_id == _id)
                 {
                     return;
@@ -152,7 +151,7 @@ struct StatusManager
     {
         for (uint16_t ii = m_messageList.count(); ii--; )
         {
-            const Message* msg = m_messageList.get(ii);
+            const Message* msg = m_messageList.getAt(ii);
             if (msg->m_id == _id)
             {
                 const uint16_t handle = m_messageList.getHandleOf(msg);
@@ -575,9 +574,9 @@ struct Animators
         m_animators[CmftTransform        ].setKeyPoints(width, _r0y, _r2x, _r2y);
         m_animators[CmftIem              ].setKeyPoints(width, _r0y, _r2x, _r2y);
         m_animators[CmftPmrem            ].setKeyPoints(width, _r0y, _r2x, _r2y);
-        m_animators[CmftSaveSkybox       ].setKeyPoints(width, _r0y, _r2x, _r2y);
-        m_animators[CmftSavePmrem        ].setKeyPoints(width, _r0y, _r2x, _r2y);
-        m_animators[CmftSaveIem          ].setKeyPoints(width, _r0y, _r2x, _r2y);
+        m_animators[CmftSaveSkybox       ].setKeyPoints(width, _r0y, _r2x-Gui::PaneWidth, _r2y);
+        m_animators[CmftSavePmrem        ].setKeyPoints(width, _r0y, _r2x-Gui::PaneWidth, _r2y);
+        m_animators[CmftSaveIem          ].setKeyPoints(width, _r0y, _r2x-Gui::PaneWidth, _r2y);
         m_animators[CmftInfoSkybox       ].setKeyPoints(width, _r0y, _r2x, _r2y);
         m_animators[CmftInfoPmrem        ].setKeyPoints(width, _r0y, _r2x, _r2y);
         m_animators[CmftInfoIem          ].setKeyPoints(width, _r0y, _r2x, _r2y);
@@ -795,14 +794,15 @@ bool guiDraw(ImguiState& _guiState
            , uint8_t _viewId
            )
 {
-    const float widthf  = g_widthf;
-    const float heightf = g_heightf;
+    g_guiHeight = DM_MAX(1022, g_height);
+    const float aspect = g_widthf/g_heightf;
+    g_guiWidth = dm::ftou(float(g_guiHeight)*aspect);
 
     const float columnLeft0X = float(Gui::BorderButtonWidth) - g_texelHalf;
     const float columnLeft1X = float(columnLeft0X + Gui::PaneWidth + Gui::HorizontalSpacing);
     const float columnLeft2X = float(columnLeft1X + Gui::PaneWidth + Gui::HorizontalSpacing);
 
-    const float columnRight0X = float(g_width       - Gui::PaneWidth - Gui::BorderButtonWidth + 1);
+    const float columnRight0X = float(g_guiWidth    - Gui::PaneWidth - Gui::BorderButtonWidth + 1);
     const float columnRight1X = float(columnRight0X - Gui::PaneWidth - Gui::HorizontalSpacing);
     const float columnRight2X = float(columnRight1X - Gui::PaneWidth - Gui::HorizontalSpacing);
 
@@ -810,14 +810,14 @@ bool guiDraw(ImguiState& _guiState
     static bool s_once = false;
     if (!s_once)
     {
-        s_animators.init(widthf, heightf
+        s_animators.init(float(g_guiWidth), float(g_guiHeight)
                        , columnLeft0X,  Gui::FirstPaneY, Gui::PaneWidth
                        , columnRight0X, Gui::FirstPaneY
                        );
         s_once = true;
     }
 
-    s_animators.setKeyPoints(widthf, heightf, Gui::PaneWidth, Gui::PaneWidth
+    s_animators.setKeyPoints(float(g_guiWidth), float(g_guiHeight), Gui::PaneWidth, Gui::PaneWidth
                            , columnLeft0X,  Gui::FirstPaneY
                            , columnLeft1X,  Gui::SecondPaneY
                            , columnLeft2X,  Gui::SecondPaneY
@@ -842,7 +842,17 @@ bool guiDraw(ImguiState& _guiState
     const uint8_t mbuttons = (Mouse::Hold == _mouse.m_left  ? IMGUI_MBUT_LEFT  : 0)
                            | (Mouse::Hold == _mouse.m_right ? IMGUI_MBUT_RIGHT : 0)
                            ;
-    imguiBeginFrame(_mouse.m_curr.m_mx, _mouse.m_curr.m_my, mbuttons, _mouse.m_scroll, uint16_t(g_width), uint16_t(g_height), _ascii, _viewId);
+    imguiBeginFrame(_mouse.m_curr.m_mx
+                  , _mouse.m_curr.m_my
+                  , mbuttons
+                  , _mouse.m_scroll
+                  , g_width
+                  , g_height
+                  , g_guiWidth
+                  , g_guiHeight
+                  , _ascii
+                  , _viewId
+                  );
 
     const bool enabled = !widgetIsVisible(Widget::ModalWindowMask);
 
@@ -857,16 +867,26 @@ bool guiDraw(ImguiState& _guiState
         widgetToggle(Widget::Left);
     }
 
+    // Adjust mouse input according to gui scale.
+    Mouse mouse;
+    memcpy(&mouse, &_mouse, sizeof(Mouse));
+    const float xScale = float(g_guiWidth)/g_widthf;
+    const float yScale = float(g_guiHeight)/g_heightf;
+    mouse.m_curr.m_mx = int32_t(float(mouse.m_curr.m_mx)*xScale);
+    mouse.m_curr.m_my = int32_t(float(mouse.m_curr.m_my)*yScale);
+    mouse.m_prev.m_mx = int32_t(float(mouse.m_prev.m_mx)*xScale);
+    mouse.m_prev.m_my = int32_t(float(mouse.m_prev.m_my)*yScale);
+
     // Right scroll area.
     if (s_animators[Animators::RightScrollArea].isVisible())
     {
         imguiRightScrollArea(int32_t(s_animators[Animators::RightScrollArea].m_x)
                            , int32_t(s_animators[Animators::RightScrollArea].m_y)
                            , Gui::PaneWidth
-                           , g_height
+                           , g_guiHeight
                            , _guiState
                            , _settings
-                           , _mouse
+                           , mouse
                            , _envList
                            , _widgetState.m_rightScrollArea
                            , enabled
@@ -910,10 +930,10 @@ bool guiDraw(ImguiState& _guiState
         imguiLeftScrollArea(int32_t(s_animators[Animators::LeftScrollArea].m_x)
                           , int32_t(s_animators[Animators::LeftScrollArea].m_y)
                           , Gui::PaneWidth
-                          , g_height
+                          , g_guiHeight
                           , _guiState
                           , _settings
-                          , _mouse
+                          , mouse
                           , _envList[_settings.m_selectedEnvMap]
                           , _meshInstList
                           , _meshInstList[_settings.m_selectedMeshIdx]
@@ -998,7 +1018,7 @@ bool guiDraw(ImguiState& _guiState
         {
             char msg[128];
             bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_meshSave.m_directory);
-            imguiStatusMessage(msg, 2.0f);
+            imguiStatusMessage(msg, 4.0f);
         }
 
         if (guiEvent(GuiEvent::DismissWindow, _widgetState.m_meshSave.m_events))
@@ -1022,7 +1042,7 @@ bool guiDraw(ImguiState& _guiState
         {
             char msg[128];
             bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_meshBrowser.m_directory);
-            imguiStatusMessage(msg, 2.0f);
+            imguiStatusMessage(msg, 4.0f);
         }
 
         if (guiEvent(GuiEvent::DismissWindow, _widgetState.m_meshBrowser.m_events))
@@ -1064,13 +1084,14 @@ bool guiDraw(ImguiState& _guiState
                                 , int32_t(s_animators[Animators::LeftTextureBrowser].m_y)
                                 , Gui::PaneWidth
                                 , _widgetState.m_textureBrowser
+                                , enabled
                                 );
 
         if (guiEvent(GuiEvent::GuiUpdate, _widgetState.m_textureBrowser.m_events))
         {
             char msg[128];
             bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_textureBrowser.m_directory);
-            imguiStatusMessage(msg, 2.0f);
+            imguiStatusMessage(msg, 4.0f);
         }
 
         if (guiEvent(GuiEvent::DismissWindow, _widgetState.m_textureBrowser.m_events))
@@ -1167,7 +1188,7 @@ bool guiDraw(ImguiState& _guiState
             {
                 char msg[128];
                 bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_skyboxBrowser.m_directory);
-                imguiStatusMessage(msg, 2.0f);
+                imguiStatusMessage(msg, 4.0f);
             }
 
             if (guiEvent(GuiEvent::DismissWindow, _widgetState.m_skyboxBrowser.m_events))
@@ -1189,7 +1210,7 @@ bool guiDraw(ImguiState& _guiState
             {
                 char msg[128];
                 bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_pmremBrowser.m_directory);
-                imguiStatusMessage(msg, 2.0f);
+                imguiStatusMessage(msg, 4.0f);
             }
 
             if (guiEvent(GuiEvent::DismissWindow, _widgetState.m_pmremBrowser.m_events))
@@ -1211,7 +1232,7 @@ bool guiDraw(ImguiState& _guiState
             {
                 char msg[128];
                 bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_iemBrowser.m_directory);
-                imguiStatusMessage(msg, 2.0f);
+                imguiStatusMessage(msg, 4.0f);
             }
 
             if (guiEvent(GuiEvent::DismissWindow, _widgetState.m_iemBrowser.m_events))
@@ -1300,7 +1321,7 @@ bool guiDraw(ImguiState& _guiState
             {
                 char msg[128];
                 bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_cmftSaveSkybox.m_directory);
-                imguiStatusMessage(msg, 2.0f);
+                imguiStatusMessage(msg, 4.0f);
             }
 
             if (guiEvent(GuiEvent::DismissWindow, _widgetState.m_cmftSaveSkybox.m_events))
@@ -1383,7 +1404,7 @@ bool guiDraw(ImguiState& _guiState
                                    , int32_t(s_animators[Animators::CmftTransform].m_y)
                                    , Gui::PaneWidth
                                    , _widgetState.m_cmftTransform
-                                   , _mouse
+                                   , mouse
                                    );
 
             if (guiEvent(GuiEvent::DismissWindow, _widgetState.m_cmftTransform.m_events))
@@ -1473,13 +1494,13 @@ bool guiDraw(ImguiState& _guiState
             {
                 char msg[128];
                 bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_projectWindow.m_load.m_directory);
-                imguiStatusMessage(msg, 2.0f);
+                imguiStatusMessage(msg, 4.0f);
             }
             else if (ProjectWindowState::ShowSaveDir == _widgetState.m_projectWindow.m_action)
             {
                 char msg[128];
                 bx::snprintf(msg, sizeof(msg), "Directory: %s", _widgetState.m_projectWindow.m_load.m_directory);
-                imguiStatusMessage(msg, 2.0f);
+                imguiStatusMessage(msg, 4.0f);
             }
         }
     }
